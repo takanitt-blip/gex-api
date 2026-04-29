@@ -1,118 +1,160 @@
 import yfinance as yf
 import pandas as pd
+import numpy as np
 import json
 import os
 import argparse
-from datetime import datetime
+from datetime import datetime, date
+from scipy.stats import norm
 
-DEFAULT_TICKER = "SPY"
+DEFAULT_TICKER       = "SPY"
 DEFAULT_HISTORY_FILE = "gex_history.json"
-ATM_RANGE = 0.15  # 現在価格の ±15% 以内のストライクに絞る
+ATM_RANGE            = 0.20  # 現在価格の上下20%のストライクを計算対象とする
+RISK_FREE_RATE       = 0.05  # リスクフリーレート（5%）
+CONTRACT_SIZE        = 100   # 1契約あたりの株数
 
+def bs_gamma(S, K, T, r, sigma):
+    """Black-Scholesモデルによるガンマの計算"""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
 
-def calculate_gex(ticker_symbol: str) -> dict:
-    print(f"--- {ticker_symbol} の解析を開始します ---")
+def time_to_expiry(expiry_str):
+    """満期までの年率換算時間を計算（0DTE対応済み）"""
+    exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    days = (exp_date - date.today()).days
+    if days <= 0:
+        days = 0.5  # 0DTE(満期日当日)は半日(0.5日)として計算に含める
+    return days / 365.0
+
+def calc_total_gex_for_spot(spot, options_data):
+    """特定の原資産価格(spot)におけるトータルGEXをシミュレーション計算する"""
+    total_gex = 0.0
+    for opt in options_data:
+        gamma = bs_gamma(spot, opt['K'], opt['T'], RISK_FREE_RATE, opt['iv'])
+        total_gex += opt['sign'] * gamma * opt['oi'] * CONTRACT_SIZE * spot
+    return total_gex
+
+def find_true_zero_gamma(current_spot, options_data):
+    """
+    原資産価格(S)を上下に動かし、Total GEXが0を跨ぐ(反転する)価格を探す。
+    これが機関投資家が用いる真の『Zero Gamma (Gamma Neutral)』。
+    """
+    # 現在価格の上下15%を0.5ドル刻みでシミュレーション
+    sim_spots = np.arange(current_spot * 0.85, current_spot * 1.15, 0.5)
+    
+    best_spot = current_spot
+    min_gex_abs = float("inf")
+    
+    for s in sim_spots:
+        gex = calc_total_gex_for_spot(s, options_data)
+        if abs(gex) < min_gex_abs:
+            min_gex_abs = abs(gex)
+            best_spot = s
+            
+    return best_spot
+
+def calculate_gex(ticker_symbol):
+    print(f"--- {ticker_symbol} の GEX 計算を開始します ---")
     ticker = yf.Ticker(ticker_symbol)
 
-    # 現在価格を取得（5日分取得して週末・祝日でも安全に対応）
     hist = ticker.history(period="5d")
     if hist.empty:
-        raise Exception("価格データが取得できませんでした。ティッカーシンボルを確認してください。")
-    current_price = float(hist["Close"].iloc[-1])
-    print(f"  現在価格: {current_price:.2f}")
+        raise Exception("価格データが取得できませんでした。")
+    S = float(hist["Close"].iloc[-1])
+    print(f"  現在価格: {S:.2f}")
 
-    # 満期日を取得（直近10件に限定）
-    expirations = ticker.options[:10]
+    expirations = ticker.options  # 制限を解除し、全限月を取得
     if not expirations:
         raise Exception("オプションデータが取得できませんでした。")
 
-    all_calls = []
-    all_puts = []
+    records =[]
+    options_data =[] # Zero Gammaシミュレーション用
 
-    # volume ベースで集計（OIはGitHub Actions環境で0になるため）
-    for date in expirations:
+    for exp_date in expirations:
+        T = time_to_expiry(exp_date)
         try:
-            opt = ticker.option_chain(date)
-
-            calls = opt.calls[["strike", "volume"]].copy()
-            puts  = opt.puts[["strike", "volume"]].copy()
-
-            # volume が NaN のものは 0 に置換
-            calls["volume"] = calls["volume"].fillna(0)
-            puts["volume"]  = puts["volume"].fillna(0)
-
-            all_calls.append(calls)
-            all_puts.append(puts)
+            chain = ticker.option_chain(exp_date)
         except Exception as e:
-            print(f"  警告: {date} の取得失敗 - {e}")
+            print(f"  警告: {exp_date} 取得失敗 - {e}")
             continue
 
-    if not all_calls or not all_puts:
-        raise Exception("有効なオプションデータが1件もありませんでした。")
+        # ディーラー視点の標準：Callは(+1)、Putは(-1)の符号をとる
+        for flag, df_opt, sign in[("call", chain.calls, 1), ("put", chain.puts, -1)]:
+            for _, row in df_opt.iterrows():
+                K    = float(row["strike"])
+                iv   = float(row["impliedVolatility"]) if row["impliedVolatility"] > 0 else None
+                oi   = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
+                
+                # OI(建玉)が0、またはIVが取得できない場合はスキップ（出来高での代替はしない）
+                if oi == 0 or iv is None:
+                    continue
+                # ATMから離れすぎているものは計算コスト削減のため除外
+                if abs(K - S) / S > ATM_RANGE:
+                    continue
+                
+                # 現在価格でのGEXを計算
+                gamma = bs_gamma(S, K, T, RISK_FREE_RATE, iv)
+                gex   = sign * gamma * oi * CONTRACT_SIZE * S
+                
+                records.append({"strike": K, "gex": gex})
+                
+                # シミュレーション用のデータを保持
+                options_data.append({
+                    "K": K, "T": T, "iv": iv, "oi": oi, "sign": sign
+                })
 
-    df_calls = pd.concat(all_calls, ignore_index=True)
-    df_puts  = pd.concat(all_puts,  ignore_index=True)
+    if not records:
+        raise Exception("GEX を計算できるデータがありませんでした。")
 
-    # ATM ±15% に絞ってノイズを低減
-    df_calls = df_calls[
-        abs(df_calls["strike"] - current_price) / current_price <= ATM_RANGE
-    ]
-    df_puts = df_puts[
-        abs(df_puts["strike"] - current_price) / current_price <= ATM_RANGE
-    ]
+    df = pd.DataFrame(records)
+    gex_by_strike = df.groupby("strike")["gex"].sum()
+    total_gex = float(gex_by_strike.sum())
 
-    if df_calls.empty or df_puts.empty:
-        raise Exception(f"ATM ±{int(ATM_RANGE*100)}% 以内にオプションデータがありませんでした。")
+    # Call Wall (プラスのGEXが最大のストライク)
+    positive_gex = gex_by_strike[gex_by_strike > 0]
+    call_wall = float(positive_gex.idxmax()) if not positive_gex.empty else float(gex_by_strike.idxmax())
 
-    # ストライクごとに volume を合計
-    call_vol_sum = df_calls.groupby("strike")["volume"].sum()
-    put_vol_sum  = df_puts.groupby("strike")["volume"].sum()
+    # Put Wall (マイナスのGEXの絶対値が最大のストライク＝最小値)
+    negative_gex = gex_by_strike[gex_by_strike < 0]
+    put_wall = float(negative_gex.idxmin()) if not negative_gex.empty else float(gex_by_strike.idxmin())
 
-    # volume が全部 0 の場合はエラー
-    if call_vol_sum.sum() == 0 or put_vol_sum.sum() == 0:
-        raise Exception(
-            "volume が全て0です。市場クローズ中か、データ取得タイミングの問題の可能性があります。"
-        )
+    # 真のZero Gammaの計算 (シミュレーション)
+    print("  Zero Gamma をシミュレーション計算中...")
+    zero_gamma = find_true_zero_gamma(S, options_data)
 
-    call_wall = float(call_vol_sum.idxmax())
-    put_wall  = float(put_vol_sum.idxmax())
+    # レジーム判定
+    if total_gex > 0:
+        regime      = "range"
+        regime_text = "レンジ相場・低ボラティリティ"
+    else:
+        regime      = "trend"
+        regime_text = "トレンド相場・高ボラティリティ"
 
-    # Zero Gamma: volume 加重平均
-    call_vol_at_wall = float(call_vol_sum[call_wall])
-    put_vol_at_wall  = float(put_vol_sum[put_wall])
-    total_vol = call_vol_at_wall + put_vol_at_wall
-    zero_gamma = (
-        (call_wall * call_vol_at_wall + put_wall * put_vol_at_wall) / total_vol
-        if total_vol > 0
-        else (call_wall + put_wall) / 2
-    )
-
-    print(
-        f"  CallWall: {call_wall:.2f} (volume: {int(call_vol_at_wall):,})\n"
-        f"  PutWall:  {put_wall:.2f} (volume: {int(put_vol_at_wall):,})\n"
-        f"  ZeroGamma:{zero_gamma:.2f}"
-    )
+    print(f"  Call Wall : {call_wall:.2f}")
+    print(f"  Put Wall  : {put_wall:.2f}")
+    print(f"  Zero Gamma: {zero_gamma:.2f}")
+    print(f"  Total GEX : {total_gex:+,.0f}  → {regime_text}")
 
     return {
-        "call_wall":        round(call_wall,    2),
-        "put_wall":         round(put_wall,     2),
-        "zero_gamma":       round(zero_gamma,   2),
-        "underlying_price": round(current_price, 2),
+        "call_wall":        round(call_wall,  2),
+        "put_wall":         round(put_wall,   2),
+        "zero_gamma":       round(zero_gamma, 2),
+        "underlying_price": round(S,          2),
+        "total_gex":        round(total_gex,  2),
+        "regime":           regime,
+        "regime_text":      regime_text,
     }
 
-
 def main():
-    parser = argparse.ArgumentParser(description="GEX トラッカー")
-    parser.add_argument("--ticker", default=DEFAULT_TICKER,
-                        help=f"ティッカーシンボル (デフォルト: {DEFAULT_TICKER})")
-    parser.add_argument("--output", default=DEFAULT_HISTORY_FILE,
-                        help=f"履歴JSONファイル名 (デフォルト: {DEFAULT_HISTORY_FILE})")
+    parser = argparse.ArgumentParser(description="GEX トラッカー（プロフェッショナル版）")
+    parser.add_argument("--ticker", default=DEFAULT_TICKER)
+    parser.add_argument("--output", default=DEFAULT_HISTORY_FILE)
     args = parser.parse_args()
 
     try:
-        new_data = calculate_gex(args.ticker)
-
-        # ⚠️ キー形式を "YYYY.MM.DD" に固定（EAの日付パース形式に合わせる）
+        new_data  = calculate_gex(args.ticker)
         today_str = datetime.now().strftime("%Y.%m.%d")
 
         history = {}
@@ -121,8 +163,7 @@ def main():
                 try:
                     history = json.load(f)
                 except json.JSONDecodeError:
-                    print("  警告: 既存の履歴ファイルが破損していたため、新規作成します。")
-                    history = {}
+                    print("  警告: 履歴ファイルが破損していたため新規作成します。")
 
         history[today_str] = new_data
 
@@ -133,7 +174,6 @@ def main():
 
     except Exception as e:
         print(f"❌ エラー: {e}")
-
 
 if __name__ == "__main__":
     main()
