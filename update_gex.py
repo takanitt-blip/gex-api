@@ -7,12 +7,19 @@ import argparse
 from datetime import datetime, date
 from scipy.stats import norm
 
+# ==========================================
+# 設定パラメータ
+# ==========================================
 DEFAULT_TICKER       = "SPY"
 DEFAULT_HISTORY_FILE = "gex_history.json"
 ATM_RANGE            = 0.20  # 現在価格の上下20%のストライクを計算対象とする
 RISK_FREE_RATE       = 0.05  # リスクフリーレート（5%）
 CONTRACT_SIZE        = 100   # 1契約あたりの株数
+MAX_DTE              = 60    # 【重要】対象とする最大残存日数 (0〜60日の短期・中期オプションに絞る)
 
+# ==========================================
+# 金融工学関数
+# ==========================================
 def bs_gamma(S, K, T, r, sigma):
     """Black-Scholesモデルによるガンマの計算"""
     if T <= 0 or sigma <= 0:
@@ -55,6 +62,9 @@ def find_true_zero_gamma(current_spot, options_data):
             
     return best_spot
 
+# ==========================================
+# メイン計算ロジック
+# ==========================================
 def calculate_gex(ticker_symbol):
     print(f"--- {ticker_symbol} の GEX 計算を開始します ---")
     ticker = yf.Ticker(ticker_symbol)
@@ -69,10 +79,16 @@ def calculate_gex(ticker_symbol):
     if not expirations:
         raise Exception("オプションデータが取得できませんでした。")
 
-    records =[]
+    records = []
     options_data =[] # Zero Gammaシミュレーション用
 
     for exp_date in expirations:
+        # 🛡️ フィルター1：DTE(残存日数)が遠すぎる長期オプション（LEAPS）を除外
+        exp_d = datetime.strptime(exp_date, "%Y-%m-%d").date()
+        days_to_exp = (exp_d - date.today()).days
+        if days_to_exp > MAX_DTE:
+            continue  # 60日より先のデータは取得すらスキップ（超高速化＆ノイズ除去）
+
         T = time_to_expiry(exp_date)
         try:
             chain = ticker.option_chain(exp_date)
@@ -91,19 +107,17 @@ def calculate_gex(ticker_symbol):
                 if oi == 0 or iv is None:
                     continue
                 
-                # 🛡️ フィルター1：IVの異常値を弾く (1%未満、または300%超えは計算バグを引き起こすため除外)
+                # 🛡️ フィルター2：IVの異常値を弾く (1%未満、または300%超えは計算バグを引き起こすため除外)
                 if iv < 0.01 or iv > 3.0:
                     continue
 
-                # 🛡️ フィルター2：DITM(ディープ・イン・ザ・マネー)のノイズを弾き、主戦場に絞る
-                # Callは「現在価格の少し下（-5%）」〜「ずっと上」までを対象
+                # 🛡️ フィルター3：DITM(ディープ・イン・ザ・マネー)のノイズを弾き、主戦場に絞る
                 if flag == "call" and K < S * 0.95: 
-                    continue
-                # Putは「現在価格の少し上（+5%）」〜「ずっと下」までを対象
+                    continue # Callは「現在価格の少し下」〜「上」を対象
                 if flag == "put" and K > S * 1.05:
-                    continue
+                    continue # Putは「現在価格の少し上」〜「下」を対象
                 
-                # ATMから離れすぎているものは計算コスト削減のため除外（上下20%の範囲）
+                # 🛡️ フィルター4：ATMから離れすぎているものは計算コスト削減のため除外
                 if abs(K - S) / S > ATM_RANGE:
                     continue
                 
@@ -119,7 +133,7 @@ def calculate_gex(ticker_symbol):
                 })
 
     if not records:
-        raise Exception("GEX を計算できるデータがありませんでした。")
+        raise Exception("GEX を計算できる有効なデータがありませんでした。")
 
     df = pd.DataFrame(records)
     gex_by_strike = df.groupby("strike")["gex"].sum()
@@ -160,6 +174,9 @@ def calculate_gex(ticker_symbol):
         "regime_text":      regime_text,
     }
 
+# ==========================================
+# エントリーポイント
+# ==========================================
 def main():
     parser = argparse.ArgumentParser(description="GEX トラッカー（プロフェッショナル版）")
     parser.add_argument("--ticker", default=DEFAULT_TICKER)
