@@ -1,9 +1,8 @@
 {
     "2026.04.29": {
         "call_wall": 975.0,
-        "put_wall": 160.0,
-        "zero_gamma": 50.0,
-        "underlying_price": 711.69,
-        "updated_at": "2026-04-29 06:28:21"
+        "put_wall": 360.0,
+        "zero_gamma": 667.5,
+        "underlying_price": 711.69
     }
 }
