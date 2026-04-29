@@ -5,71 +5,96 @@ import json
 import os
 from datetime import datetime
 
-# 保存する履歴ファイル名
+# --- 設定 ---
+TICKER_SYMBOL = "SPY"
 HISTORY_FILE = "gex_history.json"
 
 def calculate_gex():
-    ticker_symbol = "SPY"
-    ticker = yf.Ticker(ticker_symbol)
+    print(f"--- {TICKER_SYMBOL} の全オプションデータ解析を開始します ---")
+    ticker = yf.Ticker(TICKER_SYMBOL)
     
-    # 1. 最も近い満期日（限月）を取得
+    # 1. すべての満期日を取得
     expirations = ticker.options
     if not expirations:
-        raise Exception("オプションデータが見つかりません。")
+        raise Exception("オプションデータが取得できませんでした。")
     
-    target_date = expirations[0]  # 当日または直近の満期
-    opt_chain = ticker.option_chain(target_date)
-    calls = opt_chain.calls
-    puts = opt_chain.puts
-    
-    # 現在の価格（計算用の中間値として使用）
+    # 計算時点の現在価格を取得（MT5側のスケール調整用）
     current_price = ticker.history(period="1d")['Close'].iloc[-1]
+    print(f"現在価格: {current_price:.2f}")
 
-    # --- ガンマの簡易計算ロジック（Renderで使っていたもの） ---
-    # Call Wall: Open Interest（建玉）が最大の権利行使価格
-    call_wall = float(calls.loc[calls['openInterest'].idxmax()]['strike'])
+    all_calls = []
+    all_puts = []
+
+    # 2. 全ての満期日をループしてデータを集計
+    for date in expirations:
+        try:
+            opt_chain = ticker.option_chain(date)
+            all_calls.append(opt_chain.calls[['strike', 'openInterest']])
+            all_puts.append(opt_chain.puts[['strike', 'openInterest']])
+            print(f"取得済み: {date}")
+        except Exception as e:
+            print(f"スキップ: {date} (エラー: {e})")
+
+    # データフレームの統合
+    df_calls = pd.concat(all_calls)
+    df_puts = pd.concat(all_puts)
+
+    # 3. 権利行使価格（Strike）ごとに建玉（Open Interest）を合算
+    call_oi_sum = df_calls.groupby('strike')['openInterest'].sum()
+    put_oi_sum = df_puts.groupby('strike')['openInterest'].sum()
+
+    # --- Call Wall & Put Wall の算出 ---
+    # 市場全体で最も建玉が集中している価格を特定
+    call_wall = float(call_oi_sum.idxmax())
+    put_wall = float(put_oi_sum.idxmax())
+
+    # --- Zero Gamma (Proxy) の算出 ---
+    # Net OI (Call OI - Put OI) が 0 を跨ぐ、あるいは最小になるポイントを特定
+    # これにより「強気と弱気の分岐点」が正確に出ます
+    all_strikes = sorted(list(set(df_calls['strike']) | set(df_puts['strike'])))
+    net_oi = []
+    for s in all_strikes:
+        c = call_oi_sum.get(s, 0)
+        p = put_oi_sum.get(s, 0)
+        net_oi.append(abs(c - p))
     
-    # Put Wall: Open Interest（建玉）が最大の権利行使価格
-    put_wall = float(puts.loc[puts['openInterest'].idxmax()]['strike'])
-    
-    # Zero Gamma: 簡易版（CallとPutの建玉の差が最小になる点など、以前のロジックに合わせます）
-    # ここでは例として、建玉の合計が最も大きい付近を算出するロジック、
-    # または以前のコードがあればそれを反映させます。
-    # 一旦、平均値に近い統計的ポイントをZero Gammaとして計算
-    zero_gamma = (call_wall + put_wall) / 2 
+    # 最も均衡しているポイント
+    zero_gamma = float(all_strikes[np.argmin(net_oi)])
+
+    print(f"解析完了: Call Wall={call_wall}, Put Wall={put_wall}, Zero Gamma={zero_gamma}")
 
     return {
         "call_wall": round(call_wall, 2),
         "put_wall": round(put_wall, 2),
         "zero_gamma": round(zero_gamma, 2),
+        "underlying_price": round(current_price, 2),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
 def main():
     try:
-        print("データ取得中...")
         new_data = calculate_gex()
         today_str = datetime.now().strftime("%Y.%m.%d")
         
+        # 履歴の読み込みと更新
         history = {}
         if os.path.exists(HISTORY_FILE):
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                try:
                     history = json.load(f)
-            except:
-                history = {}
+                except:
+                    history = {}
         
-        # 今日の日付で保存
         history[today_str] = new_data
         
+        # 保存
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=4)
             
-        print(f"✅ {today_str} の履歴を更新しました！")
-        print(f"Call Wall: {new_data['call_wall']}, Put Wall: {new_data['put_wall']}")
+        print(f"✅ {today_str} のデータを保存しました。")
         
     except Exception as e:
-        print(f"❌ エラーが発生しました: {e}")
+        print(f"❌ 致命的なエラー: {e}")
 
 if __name__ == "__main__":
     main()
