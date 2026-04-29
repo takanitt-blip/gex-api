@@ -65,7 +65,7 @@ def calculate_gex(ticker_symbol):
     S = float(hist["Close"].iloc[-1])
     print(f"  現在価格: {S:.2f}")
 
-    expirations = ticker.options  # 制限を解除し、全限月を取得
+    expirations = ticker.options  # 全限月を取得
     if not expirations:
         raise Exception("オプションデータが取得できませんでした。")
 
@@ -87,10 +87,23 @@ def calculate_gex(ticker_symbol):
                 iv   = float(row["impliedVolatility"]) if row["impliedVolatility"] > 0 else None
                 oi   = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
                 
-                # OI(建玉)が0、またはIVが取得できない場合はスキップ（出来高での代替はしない）
+                # OI(建玉)が0、またはIVが取得できない場合はスキップ
                 if oi == 0 or iv is None:
                     continue
-                # ATMから離れすぎているものは計算コスト削減のため除外
+                
+                # 🛡️ フィルター1：IVの異常値を弾く (1%未満、または300%超えは計算バグを引き起こすため除外)
+                if iv < 0.01 or iv > 3.0:
+                    continue
+
+                # 🛡️ フィルター2：DITM(ディープ・イン・ザ・マネー)のノイズを弾き、主戦場に絞る
+                # Callは「現在価格の少し下（-5%）」〜「ずっと上」までを対象
+                if flag == "call" and K < S * 0.95: 
+                    continue
+                # Putは「現在価格の少し上（+5%）」〜「ずっと下」までを対象
+                if flag == "put" and K > S * 1.05:
+                    continue
+                
+                # ATMから離れすぎているものは計算コスト削減のため除外（上下20%の範囲）
                 if abs(K - S) / S > ATM_RANGE:
                     continue
                 
@@ -155,6 +168,7 @@ def main():
 
     try:
         new_data  = calculate_gex(args.ticker)
+        # 実行時点の日付をキーにする
         today_str = datetime.now().strftime("%Y.%m.%d")
 
         history = {}
