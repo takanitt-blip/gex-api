@@ -46,9 +46,9 @@ def calc_total_gex_for_spot(spot, options_data):
 def find_true_zero_gamma(current_spot, options_data):
     """
     原資産価格(S)を上下に動かし、Total GEXが0を跨ぐ(反転する)価格を探す。
-    これが機関投資家が用いる真の『Zero Gamma (Gamma Neutral)』。
     """
-    sim_spots = np.arange(current_spot * 0.85, current_spot * 1.15, 0.5)
+    # シミュレーション範囲をオプションデータの範囲内に限定
+    sim_spots = np.arange(current_spot * 0.95, current_spot * 1.05, 0.25)
 
     best_spot = current_spot
     min_gex_abs = float("inf")
