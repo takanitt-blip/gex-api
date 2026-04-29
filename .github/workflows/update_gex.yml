@@ -1,0 +1,31 @@
+name: Update GEX History
+
+on:
+  schedule:
+    # 日本時間の朝6:30（NY市場クローズ後）に自動実行
+    - cron: '30 21 * * *'
+  workflow_dispatch: # 手動実行ボタンを有効にする
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Python準備
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: ライブラリ取得
+        run: pip install yfinance pandas numpy
+      - name: 実行
+        run: python update_gex.py
+      - name: 履歴を保存
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add gex_history.json
+          git commit -m "Auto-update GEX history" || echo "No changes"
+          git push
