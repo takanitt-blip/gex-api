@@ -1,9 +1,12 @@
 {
     "2026.04.29": {
-        "call_wall": 712.0,
-        "put_wall": 710.0,
-        "zero_gamma": 710.89,
-        "underlying_price": 711.69
+        "call_wall": 574.0,
+        "put_wall": 745.0,
+        "zero_gamma": 782.44,
+        "underlying_price": 711.69,
+        "total_gex": -41287.96,
+        "regime": "trend",
+        "regime_text": "トレンド相場・高ボラティリティ"
     },
     "2026.04.29_0647": {
         "call_wall": 605.0,
