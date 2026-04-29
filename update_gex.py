@@ -12,8 +12,8 @@ from scipy.stats import norm
 # ==========================================
 DEFAULT_TICKER       = "SPY"
 DEFAULT_HISTORY_FILE = "gex_history.json"
-ATM_RANGE_INNER      = 0.05  # Inner Band: ±5%（短期の壁）
-ATM_RANGE_OUTER      = 0.10  # Outer Band: ±10%（最終防衛ライン）
+ATM_RANGE_INNER      = 0.03  # Inner Band: ±3%（短期の壁）
+ATM_RANGE_OUTER      = 0.05  # Outer Band: ±5%（最終防衛ライン）
 RISK_FREE_RATE       = 0.05
 CONTRACT_SIZE        = 100
 MAX_DTE              = 60
