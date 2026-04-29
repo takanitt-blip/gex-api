@@ -126,10 +126,7 @@ def calculate_gex(ticker_symbol):
                     continue
                 if iv < 0.01 or iv > 3.0:
                     continue
-                if flag == "call" and K < S * 0.95:
-                    continue
-                if flag == "put" and K > S * 1.05:
-                    continue
+
 
                 # Outer 範囲（±10%）でフィルタ
                 moneyness = abs(K - S) / S
