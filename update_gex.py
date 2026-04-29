@@ -65,6 +65,10 @@ def calculate_gex(ticker_symbol: str) -> dict:
     call_wall = float(call_oi_sum.idxmax())
     put_wall = float(put_oi_sum.idxmax())
 
+    print(f"取得した現在価格: {current_price}")
+    print(f"ATMフィルタ後のCallストライク一覧:\n{call_oi_sum.sort_index()}")
+    print(f"ATMフィルタ後のPutストライク一覧:\n{put_oi_sum.sort_index()}")
+
     # 7. Zero Gamma: OI 加重平均で算出（単純平均より精度が高い）
     call_oi_at_wall = float(call_oi_sum[call_wall])
     put_oi_at_wall = float(put_oi_sum[put_wall])
