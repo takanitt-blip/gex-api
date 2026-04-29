@@ -123,7 +123,7 @@ def calculate_gex(ticker_symbol):
                     continue
 
                 gamma = bs_gamma(S, K, T, RISK_FREE_RATE, iv)
-                gex = sign * gamma * contracts * CONTRACT_SIZE * S
+                gex = sign * gamma * contracts * CONTRACT_SIZE * (S ** 2) * 0.01
 
                 records.append({"strike": K, "gex": gex})
                 options_data.append({
