@@ -2,7 +2,7 @@
     "2026.04.29": {
         "call_wall": 715.0,
         "put_wall": 710.0,
-        "zero_gamma": 818.44,
+        "zero_gamma": 711.61,
         "underlying_price": 711.69,
         "total_gex": 2722837.77,
         "regime": "range",
