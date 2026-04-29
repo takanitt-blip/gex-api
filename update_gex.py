@@ -96,7 +96,6 @@ def calculate_gex(ticker_symbol):
     if not expirations:
         raise Exception("オプションデータが取得できませんでした。")
 
-    # Outer 範囲（±10%）で全データ収集し、Inner はそこから絞り込む
     records = []
     options_data = []
 
@@ -127,7 +126,6 @@ def calculate_gex(ticker_symbol):
                 if iv < 0.01 or iv > 3.0:
                     continue
 
-
                 # Outer 範囲（±10%）でフィルタ
                 moneyness = abs(K - S) / S
                 if moneyness > ATM_RANGE_OUTER:
@@ -153,19 +151,39 @@ def calculate_gex(ticker_symbol):
     # ── Outer Band（±10%）──
     gex_outer = df.groupby("strike")["gex"].sum()
     total_gex = float(gex_outer.sum())
+
+    # デバッグ: Outer のGEX分布
+    print("\n  [DEBUG Outer] プラスGEX上位5（現在価格より上）:")
+    pos_above_o = gex_outer[(gex_outer > 0) & (gex_outer.index >= S)].sort_values(ascending=False)
+    print(pos_above_o.head())
+
+    print("  [DEBUG Outer] マイナスGEX上位5（現在価格より下）:")
+    neg_below_o = gex_outer[(gex_outer < 0) & (gex_outer.index <= S)].sort_values()
+    print(neg_below_o.head())
+
     call_wall_outer, put_wall_outer = find_walls(gex_outer, S)
 
     # ── Inner Band（±5%）──
     df_inner = df[df["moneyness"] <= ATM_RANGE_INNER]
     if not df_inner.empty:
         gex_inner = df_inner.groupby("strike")["gex"].sum()
+
+        # デバッグ: Inner のGEX分布
+        print("\n  [DEBUG Inner] プラスGEX上位5（現在価格より上）:")
+        pos_above_i = gex_inner[(gex_inner > 0) & (gex_inner.index >= S)].sort_values(ascending=False)
+        print(pos_above_i.head())
+
+        print("  [DEBUG Inner] マイナスGEX上位5（現在価格より下）:")
+        neg_below_i = gex_inner[(gex_inner < 0) & (gex_inner.index <= S)].sort_values()
+        print(neg_below_i.head())
+
         call_wall_inner, put_wall_inner = find_walls(gex_inner, S)
     else:
         call_wall_inner = S
         put_wall_inner = S
 
     # ── Zero Gamma（ベクトル演算版）──
-    print("  Zero Gamma をベクトル演算で計算中...")
+    print("\n  Zero Gamma をベクトル演算で計算中...")
     zero_gamma = find_true_zero_gamma(S, options_data)
 
     # ── レジーム判定 ──
@@ -176,7 +194,7 @@ def calculate_gex(ticker_symbol):
         regime = "trend"
         regime_text = "トレンド相場・高ボラティリティ"
 
-    print(f"  [Inner] Call Wall: {call_wall_inner:.2f}  Put Wall: {put_wall_inner:.2f}")
+    print(f"\n  [Inner] Call Wall: {call_wall_inner:.2f}  Put Wall: {put_wall_inner:.2f}")
     print(f"  [Outer] Call Wall: {call_wall_outer:.2f}  Put Wall: {put_wall_outer:.2f}")
     print(f"  Zero Gamma : {zero_gamma:.2f}")
     print(f"  Total GEX  : {total_gex:+,.0f}  → {regime_text}")
@@ -198,7 +216,7 @@ def calculate_gex(ticker_symbol):
 # エントリーポイント
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="GEX トラッカー（2バンド版）")
+    parser = argparse.ArgumentParser(description="GEX トラッカー（2バンド版・デバッグ付き）")
     parser.add_argument("--ticker", default=DEFAULT_TICKER)
     parser.add_argument("--output", default=DEFAULT_HISTORY_FILE)
     args = parser.parse_args()
@@ -220,7 +238,7 @@ def main():
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=4, ensure_ascii=False)
 
-        print(f"✅ {today_str} のデータを '{args.output}' に保存しました。")
+        print(f"\n✅ {today_str} のデータを '{args.output}' に保存しました。")
 
     except Exception as e:
         print(f"❌ エラー: {e}")
