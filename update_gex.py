@@ -12,10 +12,10 @@ from scipy.stats import norm
 # ==========================================
 DEFAULT_TICKER       = "SPY"
 DEFAULT_HISTORY_FILE = "gex_history.json"
-ATM_RANGE            = 0.20  # 現在価格の上下20%のストライクを計算対象とする
+ATM_RANGE            = 0.10  # 上下10%の範囲に絞り、Far OTMの宝くじノイズを完全排除
 RISK_FREE_RATE       = 0.05  # リスクフリーレート（5%）
 CONTRACT_SIZE        = 100   # 1契約あたりの株数
-MAX_DTE              = 60    # 【重要】対象とする最大残存日数 (0〜60日の短期・中期オプションに絞る)
+MAX_DTE              = 60    # 対象とする最大残存日数 (0〜60日の短期オプションに絞る)
 
 # ==========================================
 # 金融工学関数
@@ -48,18 +48,17 @@ def find_true_zero_gamma(current_spot, options_data):
     原資産価格(S)を上下に動かし、Total GEXが0を跨ぐ(反転する)価格を探す。
     これが機関投資家が用いる真の『Zero Gamma (Gamma Neutral)』。
     """
-    # 現在価格の上下15%を0.5ドル刻みでシミュレーション
     sim_spots = np.arange(current_spot * 0.85, current_spot * 1.15, 0.5)
-    
+
     best_spot = current_spot
     min_gex_abs = float("inf")
-    
+
     for s in sim_spots:
         gex = calc_total_gex_for_spot(s, options_data)
         if abs(gex) < min_gex_abs:
             min_gex_abs = abs(gex)
             best_spot = s
-            
+
     return best_spot
 
 # ==========================================
@@ -75,19 +74,19 @@ def calculate_gex(ticker_symbol):
     S = float(hist["Close"].iloc[-1])
     print(f"  現在価格: {S:.2f}")
 
-    expirations = ticker.options  # 全限月を取得
+    expirations = ticker.options
     if not expirations:
         raise Exception("オプションデータが取得できませんでした。")
 
     records = []
-    options_data =[] # Zero Gammaシミュレーション用
+    options_data = []
 
     for exp_date in expirations:
-        # 🛡️ フィルター1：DTE(残存日数)が遠すぎる長期オプション（LEAPS）を除外
+        # フィルター1：DTE(残存日数)が遠すぎる長期オプション（LEAPS）を除外
         exp_d = datetime.strptime(exp_date, "%Y-%m-%d").date()
         days_to_exp = (exp_d - date.today()).days
         if days_to_exp > MAX_DTE:
-            continue  # 60日より先のデータは取得すらスキップ（超高速化＆ノイズ除去）
+            continue
 
         T = time_to_expiry(exp_date)
         try:
@@ -96,40 +95,39 @@ def calculate_gex(ticker_symbol):
             print(f"  警告: {exp_date} 取得失敗 - {e}")
             continue
 
-        # ディーラー視点の標準：Callは(+1)、Putは(-1)の符号をとる
-        for flag, df_opt, sign in[("call", chain.calls, 1), ("put", chain.puts, -1)]:
+        for flag, df_opt, sign in [("call", chain.calls, 1), ("put", chain.puts, -1)]:
             for _, row in df_opt.iterrows():
-                K    = float(row["strike"])
-                iv   = float(row["impliedVolatility"]) if row["impliedVolatility"] > 0 else None
-                oi   = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
-                
-                # OI(建玉)が0、またはIVが取得できない場合はスキップ
-                if oi == 0 or iv is None:
+                K  = float(row["strike"])
+                iv = float(row["impliedVolatility"]) if row["impliedVolatility"] > 0 else None
+                oi = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
+                vol = float(row["volume"]) if not pd.isna(row["volume"]) else 0
+
+                # フィルター2：yfinance特有の「早朝OI消失バグ」対策
+                contracts = oi if oi > 0 else vol
+
+                if contracts == 0 or iv is None:
                     continue
-                
-                # 🛡️ フィルター2：IVの異常値を弾く (1%未満、または300%超えは計算バグを引き起こすため除外)
+
+                # フィルター3：IVの異常値を弾く
                 if iv < 0.01 or iv > 3.0:
                     continue
 
-                # 🛡️ フィルター3：DITM(ディープ・イン・ザ・マネー)のノイズを弾き、主戦場に絞る
-                if flag == "call" and K < S * 0.95: 
-                    continue # Callは「現在価格の少し下」〜「上」を対象
+                # フィルター4：DITM(ディープ・イン・ザ・マネー)のノイズを弾く
+                if flag == "call" and K < S * 0.95:
+                    continue
                 if flag == "put" and K > S * 1.05:
-                    continue # Putは「現在価格の少し上」〜「下」を対象
-                
-                # 🛡️ フィルター4：ATMから離れすぎているものは計算コスト削減のため除外
+                    continue
+
+                # フィルター5：ATM_RANGE外のFar OTMを弾く
                 if abs(K - S) / S > ATM_RANGE:
                     continue
-                
-                # 現在価格でのGEXを計算
+
                 gamma = bs_gamma(S, K, T, RISK_FREE_RATE, iv)
-                gex   = sign * gamma * oi * CONTRACT_SIZE * S
-                
+                gex = sign * gamma * contracts * CONTRACT_SIZE * S
+
                 records.append({"strike": K, "gex": gex})
-                
-                # シミュレーション用のデータを保持
                 options_data.append({
-                    "K": K, "T": T, "iv": iv, "oi": oi, "sign": sign
+                    "K": K, "T": T, "iv": iv, "oi": contracts, "sign": sign
                 })
 
     if not records:
@@ -139,13 +137,13 @@ def calculate_gex(ticker_symbol):
     gex_by_strike = df.groupby("strike")["gex"].sum()
     total_gex = float(gex_by_strike.sum())
 
-    # Call Wall (プラスのGEXが最大のストライク)
-    positive_gex = gex_by_strike[gex_by_strike > 0]
-    call_wall = float(positive_gex.idxmax()) if not positive_gex.empty else float(gex_by_strike.idxmax())
+    # Call Wall: 現在価格より上で、プラスGEXが最大のストライク
+    positive_above = gex_by_strike[(gex_by_strike > 0) & (gex_by_strike.index >= S)]
+    call_wall = float(positive_above.idxmax()) if not positive_above.empty else S
 
-    # Put Wall (マイナスのGEXの絶対値が最大のストライク＝最小値)
-    negative_gex = gex_by_strike[gex_by_strike < 0]
-    put_wall = float(negative_gex.idxmin()) if not negative_gex.empty else float(gex_by_strike.idxmin())
+    # Put Wall: 現在価格より下で、マイナスGEXの絶対値が最大のストライク
+    negative_below = gex_by_strike[(gex_by_strike < 0) & (gex_by_strike.index <= S)]
+    put_wall = float(negative_below.idxmin()) if not negative_below.empty else S
 
     # 真のZero Gammaの計算 (シミュレーション)
     print("  Zero Gamma をシミュレーション計算中...")
@@ -153,10 +151,10 @@ def calculate_gex(ticker_symbol):
 
     # レジーム判定
     if total_gex > 0:
-        regime      = "range"
+        regime = "range"
         regime_text = "レンジ相場・低ボラティリティ"
     else:
-        regime      = "trend"
+        regime = "trend"
         regime_text = "トレンド相場・高ボラティリティ"
 
     print(f"  Call Wall : {call_wall:.2f}")
@@ -178,14 +176,13 @@ def calculate_gex(ticker_symbol):
 # エントリーポイント
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="GEX トラッカー（プロフェッショナル版）")
+    parser = argparse.ArgumentParser(description="GEX トラッカー（最終・完全版）")
     parser.add_argument("--ticker", default=DEFAULT_TICKER)
     parser.add_argument("--output", default=DEFAULT_HISTORY_FILE)
     args = parser.parse_args()
 
     try:
-        new_data  = calculate_gex(args.ticker)
-        # 実行時点の日付をキーにする
+        new_data = calculate_gex(args.ticker)
         today_str = datetime.now().strftime("%Y.%m.%d")
 
         history = {}
