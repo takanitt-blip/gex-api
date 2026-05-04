@@ -25,5 +25,14 @@
         "total_gex": 3004225856.0,
         "regime": "range",
         "regime_text": "レンジ相場・低ボラティリティ"
+    },
+    "2026.05.04": {
+        "call_wall": 725.0,
+        "put_wall": 700.0,
+        "zero_gamma": 718.86,
+        "underlying_price": 718.01,
+        "total_gex": -3333105321.48,
+        "regime": "trend",
+        "regime_text": "トレンド相場・高ボラティリティ"
     }
 }
