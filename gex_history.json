@@ -72,18 +72,18 @@
     "regime_text": "レンジ相場・低ボラティリティ"
   },
   "2026.05.10": {
-    "call_wall": 465.0,
-    "put_wall": 435.0,
-    "zero_gamma": 441.93,
-    "max_pain": 450.0,
-    "underlying_price": 450.0,
-    "total_gex": 13152592,
+    "call_wall": 740.0,
+    "put_wall": 710.0,
+    "zero_gamma": 727.92,
+    "max_pain": 700.0,
+    "underlying_price": 737.44,
+    "total_gex": 6378591088,
     "regime": "range",
     "regime_text": "レンジ相場・低ボラティリティ",
-    "timestamp": "2026-05-10T12:51:52Z",
-    "data_source": "mock",
+    "timestamp": "2026-05-10T14:55:19Z",
+    "data_source": "rest",
     "symbol": "SPY",
     "as_of": "2026-05-10T00:00:00",
-    "n_contracts_used": 113257
+    "n_contracts_used": 18275575
   }
 }
