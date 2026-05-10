@@ -1,74 +1,89 @@
 {
-    "2026.04.29": {
-        "call_wall": 712.0,
-        "put_wall": 700.0,
-        "zero_gamma": 711.25,
-        "underlying_price": 711.58,
-        "total_gex": 2994863293.26,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.04.30": {
-        "call_wall": 720.0,
-        "put_wall": 700.0,
-        "zero_gamma": 711.23,
-        "underlying_price": 718.66,
-        "total_gex": 10205829822.13,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.05.01": {
-        "call_wall": 721.0,
-        "put_wall": 700.0,
-        "zero_gamma": 720.37,
-        "underlying_price": 720.65,
-        "total_gex": 3004225856.0,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.05.04": {
-        "call_wall": 725.0,
-        "put_wall": 700.0,
-        "zero_gamma": 718.86,
-        "underlying_price": 718.01,
-        "total_gex": -3333105321.48,
-        "regime": "trend",
-        "regime_text": "トレンド相場・高ボラティリティ"
-    },
-    "2026.05.05": {
-        "call_wall": 724.0,
-        "put_wall": 700.0,
-        "zero_gamma": 720.08,
-        "underlying_price": 723.77,
-        "total_gex": 8713606247.18,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.05.06": {
-        "call_wall": 734.0,
-        "put_wall": 700.0,
-        "zero_gamma": 721.89,
-        "underlying_price": 733.83,
-        "total_gex": 10935889196.38,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.05.07": {
-        "call_wall": 732.0,
-        "put_wall": 700.0,
-        "zero_gamma": 730.25,
-        "underlying_price": 731.58,
-        "total_gex": 6939472654.28,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    },
-    "2026.05.08": {
-        "call_wall": 740.0,
-        "put_wall": 710.0,
-        "zero_gamma": 729.49,
-        "underlying_price": 737.62,
-        "total_gex": 6315157619.73,
-        "regime": "range",
-        "regime_text": "レンジ相場・低ボラティリティ"
-    }
+  "2026.04.29": {
+    "call_wall": 712.0,
+    "put_wall": 700.0,
+    "zero_gamma": 711.25,
+    "underlying_price": 711.58,
+    "total_gex": 2994863293.26,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.04.30": {
+    "call_wall": 720.0,
+    "put_wall": 700.0,
+    "zero_gamma": 711.23,
+    "underlying_price": 718.66,
+    "total_gex": 10205829822.13,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.01": {
+    "call_wall": 721.0,
+    "put_wall": 700.0,
+    "zero_gamma": 720.37,
+    "underlying_price": 720.65,
+    "total_gex": 3004225856.0,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.04": {
+    "call_wall": 725.0,
+    "put_wall": 700.0,
+    "zero_gamma": 718.86,
+    "underlying_price": 718.01,
+    "total_gex": -3333105321.48,
+    "regime": "trend",
+    "regime_text": "トレンド相場・高ボラティリティ"
+  },
+  "2026.05.05": {
+    "call_wall": 724.0,
+    "put_wall": 700.0,
+    "zero_gamma": 720.08,
+    "underlying_price": 723.77,
+    "total_gex": 8713606247.18,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.06": {
+    "call_wall": 734.0,
+    "put_wall": 700.0,
+    "zero_gamma": 721.89,
+    "underlying_price": 733.83,
+    "total_gex": 10935889196.38,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.07": {
+    "call_wall": 732.0,
+    "put_wall": 700.0,
+    "zero_gamma": 730.25,
+    "underlying_price": 731.58,
+    "total_gex": 6939472654.28,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.08": {
+    "call_wall": 740.0,
+    "put_wall": 710.0,
+    "zero_gamma": 729.49,
+    "underlying_price": 737.62,
+    "total_gex": 6315157619.73,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ"
+  },
+  "2026.05.10": {
+    "call_wall": 465.0,
+    "put_wall": 435.0,
+    "zero_gamma": 441.93,
+    "max_pain": 450.0,
+    "underlying_price": 450.0,
+    "total_gex": 13152592,
+    "regime": "range",
+    "regime_text": "レンジ相場・低ボラティリティ",
+    "timestamp": "2026-05-10T07:31:09Z",
+    "data_source": "mock",
+    "symbol": "SPY",
+    "as_of": "2026-05-10T00:00:00",
+    "n_contracts_used": 113257
+  }
 }
