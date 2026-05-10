@@ -355,6 +355,92 @@ class TestRetryable:
 
 
 # ──────────────────────────────────────────────────────────
+# 実 API レスポンスの正規化（誤判断18 で発覚）
+# ──────────────────────────────────────────────────────────
+
+class TestRightColumnNormalization:
+    """実 ThetaData の CSV は right を CALL/PUT 大文字で返すが、
+    統一スキーマは call/put 小文字。Adapter で正規化されることを確認。
+
+    v15 段階 6C 初回実行で発覚（誤判断18）。フィクスチャは小文字で
+    作成されていたため、実 API との乖離をテストで検出できなかった。
+    """
+
+    @respx.mock
+    def test_oi_uppercase_right_is_normalized_to_lowercase(self, adapter):
+        """OI レスポンスが CALL/PUT で来ても、出力は call/put になる。"""
+        # 実 ThetaData の出力を再現（right が大文字）
+        oi_uppercase = (
+            "timestamp,symbol,expiration,strike,right,open_interest\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,CALL,5800\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,PUT,5500\n"
+        )
+        iv_lowercase = (
+            "symbol,expiration,strike,right,timestamp,bid,ask,implied_vol,iv_error,underlying_timestamp,underlying_price\n"
+            "SPY,2026-05-16,450.00,call,2026-05-09T16:30:00.000,4.20,4.35,0.148,0.001,2026-05-09T16:30:00.000,450.25\n"
+            "SPY,2026-05-16,450.00,put,2026-05-09T16:30:00.000,4.40,4.55,0.152,0.001,2026-05-09T16:30:00.000,450.25\n"
+        )
+        respx.get(OI_URL).mock(return_value=httpx.Response(200, text=oi_uppercase))
+        respx.get(IV_URL).mock(return_value=httpx.Response(200, text=iv_lowercase))
+
+        df = adapter.get_option_chain("SPY", date(2026, 5, 9))
+
+        # 結合後の right はすべて小文字
+        assert set(df["right"].unique()) == {"call", "put"}
+        assert len(df) == 2  # 2 件マージ成功
+
+    @respx.mock
+    def test_iv_uppercase_right_is_normalized_to_lowercase(self, adapter):
+        """IV レスポンスが CALL/PUT で来ても、出力は call/put になる。"""
+        oi_lowercase = (
+            "timestamp,symbol,expiration,strike,right,open_interest\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,call,5800\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,put,5500\n"
+        )
+        iv_uppercase = (
+            "symbol,expiration,strike,right,timestamp,bid,ask,implied_vol,iv_error,underlying_timestamp,underlying_price\n"
+            "SPY,2026-05-16,450.00,CALL,2026-05-09T16:30:00.000,4.20,4.35,0.148,0.001,2026-05-09T16:30:00.000,450.25\n"
+            "SPY,2026-05-16,450.00,PUT,2026-05-09T16:30:00.000,4.40,4.55,0.152,0.001,2026-05-09T16:30:00.000,450.25\n"
+        )
+        respx.get(OI_URL).mock(return_value=httpx.Response(200, text=oi_lowercase))
+        respx.get(IV_URL).mock(return_value=httpx.Response(200, text=iv_uppercase))
+
+        df = adapter.get_option_chain("SPY", date(2026, 5, 9))
+
+        assert set(df["right"].unique()) == {"call", "put"}
+        assert len(df) == 2
+
+    @respx.mock
+    def test_both_uppercase_real_thetadata_pattern(self, adapter):
+        """実 ThetaData の動作を完全再現: OI も IV も大文字。"""
+        oi_uppercase = (
+            "timestamp,symbol,expiration,strike,right,open_interest\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,CALL,5800\n"
+            "2026-05-09T16:30:00.000,SPY,2026-05-16,450.00,PUT,5500\n"
+        )
+        iv_uppercase = (
+            "symbol,expiration,strike,right,timestamp,bid,ask,implied_vol,iv_error,underlying_timestamp,underlying_price\n"
+            "SPY,2026-05-16,450.00,CALL,2026-05-09T16:30:00.000,4.20,4.35,0.148,0.001,2026-05-09T16:30:00.000,450.25\n"
+            "SPY,2026-05-16,450.00,PUT,2026-05-09T16:30:00.000,4.40,4.55,0.152,0.001,2026-05-09T16:30:00.000,450.25\n"
+        )
+        respx.get(OI_URL).mock(return_value=httpx.Response(200, text=oi_uppercase))
+        respx.get(IV_URL).mock(return_value=httpx.Response(200, text=iv_uppercase))
+
+        df = adapter.get_option_chain("SPY", date(2026, 5, 9))
+
+        # 結合は (symbol, expiration, strike, right) なので、
+        # 両側が同じ大文字小文字でないと結合できないことに注意。
+        # Adapter がどちらも小文字に正規化するから結合できる。
+        assert set(df["right"].unique()) == {"call", "put"}
+        assert len(df) == 2
+
+        # スキーマバリデーションも通る
+        from gex_engine.schema import validate
+        result = validate(df)
+        assert result.is_valid, f"errors: {result.errors}"
+
+
+# ──────────────────────────────────────────────────────────
 # レスポンス列の不整合（防御的プログラミング）
 # ──────────────────────────────────────────────────────────
 
