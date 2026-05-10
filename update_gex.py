@@ -1,209 +1,156 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import json
-import os
-import argparse
-from datetime import datetime, date
-from scipy.stats import norm
+name: Update GEX History
 
-# ==========================================
-# 設定パラメータ
-# ==========================================
-DEFAULT_TICKER       = "SPY"
-DEFAULT_HISTORY_FILE = "gex_history.json"
-ATM_RANGE            = 0.05  # ±5%
-RISK_FREE_RATE       = 0.05
-CONTRACT_SIZE        = 100
-MAX_DTE              = 60
+# ─────────────────────────────────────────────────────────────
+# 段階 6B (v16): Theta Terminal セットアップの動作確認
+# ─────────────────────────────────────────────────────────────
+# このワークフローの責務:
+#   1. Java 25 セットアップ
+#   2. Theta Terminal v3 jar を公式 URL から動的 DL
+#   3. secrets.THETA_CREDS を creds.txt として配置
+#   4. Terminal をバックグラウンド起動
+#   5. ヘルスチェック (リトライループで起動完了を待つ)
+#   6. requirements.txt から依存パッケージをインストール
+#   7. テストを走らせて 192 tests pass を確認
+#   8. Mock Adapter で run_daily.py を実行し、gex_history.json を生成
+#   9. 差分があれば自動コミット & push
+#
+# 段階 6B では:
+#   - cron はコメントアウトのまま (段階 6D で UTC 22:30 を有効化)
+#   - workflow_dispatch (手動実行) のみ有効
+#   - GEX_DATA_SOURCE は "mock" に固定 (段階 6C で "rest" に切替)
+#   - Theta Terminal は起動して疎通確認するだけで、Mock 実行には使われない
+#     (この段階の目的は「Java + Terminal セットアップが Actions で動くこと」
+#      の検証であり、データ取得は段階 6C 以降)
+#
+# 段階 6C で変更するもの:
+#   - GEX_DATA_SOURCE: "rest" に切替
+#
+# 段階 6D で変更するもの:
+#   - cron: '30 22 * * 1-5' を有効化
+#
+# ─────────────────────────────────────────────────────────────
 
-# ==========================================
-# 金融工学関数
-# ==========================================
-def bs_gamma(S, K, T, r, sigma):
-    """Black-Scholesモデルによるガンマの計算"""
-    if T <= 0 or sigma <= 0:
-        return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+on:
+  # ── 段階 6B ではコメントアウトのまま ──
+  # schedule:
+  #   - cron: '30 22 * * 1-5'   # UTC 22:30 (ET 17:30 EDT / 18:30 EST)
+  workflow_dispatch:           # 手動実行で疎通確認
 
+permissions:
+  contents: write              # gex_history.json を commit & push するため
 
-def time_to_expiry(expiry_str):
-    """満期までの年率換算時間を計算（0DTE対応済み）"""
-    exp_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-    days = (exp_date - date.today()).days
-    if days <= 0:
-        days = 0.5
-    return days / 365.0
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # ───── 環境構築 ─────
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
 
-def find_true_zero_gamma(current_spot, options_data):
-    """numpy ベクトル演算で Zero Gamma を高速計算"""
-    if not options_data:
-        return current_spot
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
 
-    sim_spots = np.arange(current_spot * 0.95, current_spot * 1.05, 0.25)
+      - name: Verify Java version
+        run: java -version
 
-    K    = np.array([o['K']    for o in options_data])
-    T    = np.array([o['T']    for o in options_data])
-    iv   = np.array([o['iv']   for o in options_data])
-    oi   = np.array([o['oi']   for o in options_data])
-    sign = np.array([o['sign'] for o in options_data])
+      # ───── Theta Terminal セットアップ ─────
+      - name: Download Theta Terminal v3 jar (from official URL)
+        run: |
+          curl -L -o ThetaTerminalv3.jar https://download-latest.thetadata.us
+          ls -lh ThetaTerminalv3.jar
 
-    S_grid = sim_spots[:, np.newaxis]
+      - name: Configure creds.txt
+        # secrets.THETA_CREDS には改行区切りで
+        #   1 行目: メールアドレス
+        #   2 行目: パスワード
+        # を登録しておく前提
+        run: |
+          printf '%s\n' "${{ secrets.THETA_CREDS }}" > creds.txt
+          # creds.txt の中身は出力しない（パスワード保護）
+          # 行数のみ確認
+          wc -l creds.txt
 
-    d1 = (np.log(S_grid / K) + (RISK_FREE_RATE + 0.5 * iv ** 2) * T) / (iv * np.sqrt(T))
-    gamma = norm.pdf(d1) / (S_grid * iv * np.sqrt(T))
-    gex = sign * gamma * oi * CONTRACT_SIZE * (S_grid ** 2) * 0.01
+      - name: Start Theta Terminal in background
+        # nohup でバックグラウンド起動、ログは theta_terminal.log に書き出す
+        # 起動失敗時のデバッグのため、ログは後段で必ず確認する
+        run: |
+          nohup java -jar ThetaTerminalv3.jar > theta_terminal.log 2>&1 &
+          echo "Started Theta Terminal with PID $!"
+          echo "$!" > theta_terminal.pid
 
-    total_gex = gex.sum(axis=1)
-    best_idx = np.argmin(np.abs(total_gex))
-    return float(sim_spots[best_idx])
+      - name: Wait for Theta Terminal health check
+        # 最大 60 秒、1 秒ごとに /v3/stock/list/symbols を叩いて 200 を待つ
+        # 段階 6B-1 確認2 で「Stock: FREE 環境でも候補A は 200 で返る」と確認済み
+        #
+        # curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
+        # || echo "000" は不要（付けると "000000" の二重出力になる）。
+        run: |
+          set +e  # curl 失敗時に即座に exit しない
+          for i in $(seq 1 60); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:25503/v3/stock/list/symbols?format=csv" 2>/dev/null)
+            if [ "$status" = "200" ]; then
+              echo "Theta Terminal is ready (took ${i} seconds)"
+              exit 0
+            fi
+            echo "Attempt ${i}/60: HTTP $status, waiting..."
+            sleep 1
+          done
+          echo "❌ Theta Terminal did not become ready within 60 seconds"
+          echo "── theta_terminal.log (last 50 lines) ──"
+          tail -50 theta_terminal.log || true
+          exit 1
 
+      - name: Show Theta Terminal startup log (for confirmation)
+        # 起動ログを Actions ログに出力（バージョン番号や Subscription 状態を確認）
+        # PROJECT_CONTEXT v16 で「実 API 環境で踏みやすい 3 つの地雷
+        # (471 PERMISSION / 476 WRONG_IP / 478 多重起動)」を後から検証するため
+        run: |
+          echo "── theta_terminal.log (head 30 lines) ──"
+          head -30 theta_terminal.log
 
-# ==========================================
-# メイン計算ロジック
-# ==========================================
-def calculate_gex(ticker_symbol):
-    print(f"--- {ticker_symbol} の GEX 計算を開始します ---")
-    ticker = yf.Ticker(ticker_symbol)
+      # ───── Python 依存と検証 ─────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    hist = ticker.history(period="5d")
-    if hist.empty:
-        raise Exception("価格データが取得できませんでした。")
-    S = float(hist["Close"].iloc[-1])
-    print(f"  現在価格: {S:.2f}")
+      - name: Run tests
+        run: python -m pytest gex_engine/tests/ -q
 
-    expirations = ticker.options
-    if not expirations:
-        raise Exception("オプションデータが取得できませんでした。")
+      # ───── Mock 駆動で daily run ─────
+      - name: Run daily GEX update (Mock)
+        # 段階 6B では Theta Terminal を起動するが、Mock を使うため
+        # 実際にはデータ取得には使われない (段階 6C で rest に切替)
+        env:
+          GEX_DATA_SOURCE: mock
+        run: python -m gex_engine.scripts.run_daily
 
-    records = []
-    options_data = []
+      # ───── 結果コミット ─────
+      - name: Commit gex_history.json if changed
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add gex_history.json
+          git diff --quiet && git diff --staged --quiet \
+            || (git commit -m "Auto-update GEX history (mock, stage 6B)" && git push)
 
-    for exp_date in expirations:
-        # フィルター1：DTE が遠すぎる長期オプション（LEAPS）を除外
-        exp_d = datetime.strptime(exp_date, "%Y-%m-%d").date()
-        days_to_exp = (exp_d - date.today()).days
-        if days_to_exp > MAX_DTE:
-            continue
-
-        T = time_to_expiry(exp_date)
-        try:
-            chain = ticker.option_chain(exp_date)
-        except Exception as e:
-            print(f"  警告: {exp_date} 取得失敗 - {e}")
-            continue
-
-        for flag, df_opt, sign in [("call", chain.calls, 1), ("put", chain.puts, -1)]:
-            for _, row in df_opt.iterrows():
-                K  = float(row["strike"])
-                iv = float(row["impliedVolatility"]) if row["impliedVolatility"] > 0 else None
-                oi = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
-                vol = float(row["volume"]) if not pd.isna(row["volume"]) else 0
-
-                # フィルター2：yfinance の「早朝OI消失バグ」対策
-                contracts = oi if oi > 0 else vol
-
-                if contracts == 0 or iv is None:
-                    continue
-
-                # フィルター3：IV の異常値を弾く
-                if iv < 0.01 or iv > 3.0:
-                    continue
-
-                # フィルター4：DITM（ディープ・イン・ザ・マネー）のノイズを弾く
-                if flag == "call" and K < S * 0.95:
-                    continue
-                if flag == "put" and K > S * 1.05:
-                    continue
-
-                # フィルター5：ATM_RANGE 外の Far OTM を弾く
-                if abs(K - S) / S > ATM_RANGE:
-                    continue
-
-                gamma = bs_gamma(S, K, T, RISK_FREE_RATE, iv)
-                gex = sign * gamma * contracts * CONTRACT_SIZE * (S ** 2) * 0.01
-
-                records.append({"strike": K, "gex": gex})
-                options_data.append({
-                    "K": K, "T": T, "iv": iv, "oi": contracts, "sign": sign
-                })
-
-    if not records:
-        raise Exception("GEX を計算できる有効なデータがありませんでした。")
-
-    df = pd.DataFrame(records)
-    gex_by_strike = df.groupby("strike")["gex"].sum()
-    total_gex = float(gex_by_strike.sum())
-
-    # Call Wall: 現在価格より上で、プラスGEXが最大のストライク
-    positive_above = gex_by_strike[(gex_by_strike > 0) & (gex_by_strike.index >= S)]
-    call_wall = float(positive_above.idxmax()) if not positive_above.empty else S
-
-    # Put Wall: 現在価格より下で、マイナスGEXの絶対値が最大のストライク
-    negative_below = gex_by_strike[(gex_by_strike < 0) & (gex_by_strike.index <= S)]
-    put_wall = float(negative_below.idxmin()) if not negative_below.empty else S
-
-    # Zero Gamma（ベクトル演算版）
-    print("  Zero Gamma をベクトル演算で計算中...")
-    zero_gamma = find_true_zero_gamma(S, options_data)
-
-    # レジーム判定
-    if total_gex > 0:
-        regime = "range"
-        regime_text = "レンジ相場・低ボラティリティ"
-    else:
-        regime = "trend"
-        regime_text = "トレンド相場・高ボラティリティ"
-
-    print(f"  Call Wall : {call_wall:.2f}")
-    print(f"  Put Wall  : {put_wall:.2f}")
-    print(f"  Zero Gamma: {zero_gamma:.2f}")
-    print(f"  Total GEX : {total_gex:+,.0f}  → {regime_text}")
-
-    return {
-        "call_wall":        round(call_wall,  2),
-        "put_wall":         round(put_wall,   2),
-        "zero_gamma":       round(zero_gamma, 2),
-        "underlying_price": round(S,          2),
-        "total_gex":        round(total_gex,  2),
-        "regime":           regime,
-        "regime_text":      regime_text,
-    }
-
-
-# ==========================================
-# エントリーポイント
-# ==========================================
-def main():
-    parser = argparse.ArgumentParser(description="GEX トラッカー（最終版）")
-    parser.add_argument("--ticker", default=DEFAULT_TICKER)
-    parser.add_argument("--output", default=DEFAULT_HISTORY_FILE)
-    args = parser.parse_args()
-
-    try:
-        new_data = calculate_gex(args.ticker)
-        today_str = datetime.now().strftime("%Y.%m.%d")
-
-        history = {}
-        if os.path.exists(args.output):
-            with open(args.output, "r", encoding="utf-8") as f:
-                try:
-                    history = json.load(f)
-                except json.JSONDecodeError:
-                    print("  警告: 履歴ファイルが破損していたため新規作成します。")
-
-        history[today_str] = new_data
-
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=4, ensure_ascii=False)
-
-        print(f"✅ {today_str} のデータを '{args.output}' に保存しました。")
-
-    except Exception as e:
-        print(f"❌ エラー: {e}")
-
-
-if __name__ == "__main__":
-    main()
+      # ───── 後片付け (任意) ─────
+      - name: Stop Theta Terminal
+        # ジョブ終了時に runner ごと破棄されるので必須ではないが、
+        # 明示的に停止することで「Terminal が動作していた」事実を確認できる
+        if: always()
+        run: |
+          if [ -f theta_terminal.pid ]; then
+            pid=$(cat theta_terminal.pid)
+            kill "$pid" 2>/dev/null || true
+            echo "Stopped Theta Terminal (PID $pid)"
+          fi
