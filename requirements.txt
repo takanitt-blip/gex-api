@@ -1,6 +1,12 @@
-fastapi
-uvicorn
-yfinance
-pandas
-numpy
-scipy
+# GEX Engine v14 dependencies
+# 段階5 で v9 (yfinance) 版から全面書き換え
+
+# === Core runtime ===
+httpx>=0.27       # REST Adapter (ThetaData v3)
+pandas>=2.0       # DataFrame 操作
+numpy>=1.24       # 数値計算
+scipy>=1.11       # Brent法 (zero_gamma 探索), norm.cdf (Black-Scholes)
+
+# === Test (GitHub Actions の CI で全テスト走らせるため同梱) ===
+pytest>=8.0       # テストランナー
+respx>=0.21       # httpx モック (test_rest_adapter で使用)

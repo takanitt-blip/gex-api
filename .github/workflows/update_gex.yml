@@ -1,38 +1,70 @@
 name: Update GEX History
 
+# ─────────────────────────────────────────────────────────────
+# 段階5 (v14): Mock 駆動の CI/CD 疎通確認
+# ─────────────────────────────────────────────────────────────
+# このワークフローの責務:
+#   1. requirements.txt から依存パッケージをインストール
+#   2. テストを走らせて 192 tests pass を確認
+#   3. Mock Adapter で run_daily.py を実行し、gex_history.json を生成
+#   4. 差分があれば自動コミット & push
+#
+# 段階5 では:
+#   - cron はコメントアウト（毎日 Mock を回しても出力が決定論的で同じ値、
+#     git push の意味がない。実 API 接続後の段階6 で有効化する）
+#   - workflow_dispatch（手動実行）のみ有効
+#   - Java + Theta Terminal v3 のセットアップは段階6 で追加
+#   - GEX_DATA_SOURCE は "mock" に固定
+#
+# 段階6 で追加するもの（このファイルに後で足す）:
+#   - cron: '30 22 * * 1-5' を有効化（UTC 22:30 = ET 17:30/18:30）
+#   - actions/setup-java@v4 ステップ
+#   - bin/ThetaTerminalv3.jar の配置・起動・ヘルスチェック
+#   - secrets.THETA_CREDS の echo
+#   - GEX_DATA_SOURCE: "rest" に切替
+# ─────────────────────────────────────────────────────────────
+
 on:
-  schedule:
-    # 毎日 UTC 19:30 (日本時間 午前4:30) に実行
-    # UTCの月〜金曜日（日本時間だと火曜〜土曜の朝）のみ実行
-    - cron: '30 19 * * 1-5'
-  workflow_dispatch: # 手動実行ボタンを有効にする
+  # ── 段階5 ではコメントアウト ──
+  # schedule:
+  #   - cron: '30 22 * * 1-5'   # UTC 22:30 (ET 17:30 EDT / 18:30 EST)
+  workflow_dispatch:           # 手動実行で疎通確認
 
 permissions:
-  contents: write
+  contents: write              # gex_history.json を commit & push するため
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Python準備
-        uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
+          cache: 'pip'
 
-      - name: ライブラリ取得
-        # ★修正: scipyを追加しました
-        run: pip install yfinance pandas numpy scipy
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: 実行
-        run: python update_gex.py
+      - name: Run tests
+        run: python -m pytest gex_engine/tests/ -q
 
-      - name: 履歴を保存
+      - name: Run daily GEX update (Mock)
+        env:
+          GEX_DATA_SOURCE: mock
+        run: python -m gex_engine.scripts.run_daily
+
+      - name: Commit gex_history.json if changed
+        # 既存 v9 のロジックを踏襲: 変更がなければスキップ、
+        # 変更があれば commit + push
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add gex_history.json
-          
-          # ★修正: 変更がない場合はcommitをスキップし、エラーで落ちないようにするより安全な書き方
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update GEX history" && git push)
+          git diff --quiet && git diff --staged --quiet \
+            || (git commit -m "Auto-update GEX history (mock)" && git push)
