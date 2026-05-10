@@ -100,6 +100,42 @@ def make_fetcher(source: str) -> DataFetcher:
 
 
 # ──────────────────────────────────────────────────────────
+# 診断ログ（段階 6C 検証用、rest のときのみ呼ばれる）
+# ──────────────────────────────────────────────────────────
+
+def _log_oi_distribution(df, log) -> None:
+    """OI トップ 10 ストライクをログに出力。
+
+    段階 6C の合格基準 E 第 2 項「Walls が大量 OI ストライクと整合」を
+    Actions ログだけで検証可能にするための診断出力。
+
+    Mock のときは呼ばれないので、ログを汚さない。
+
+    例外は握り潰す（メイン処理は既に完了しているため、
+    診断ログの失敗で Job を落とすべきでない）。
+
+    TODO(stage-6E-end): 観察期間が終わって安定運用に入ったら、
+        この診断ログの恒久化 / 削除 / 別ツール化を判断する。
+    """
+    try:
+        # (strike, right) 単位で OI 合計、トップ 10 を取得
+        top = (
+            df.groupby(["strike", "right"])["open_interest"]
+              .sum()
+              .sort_values(ascending=False)
+              .head(10)
+        )
+
+        log.info("── OI top 10 strikes (for stage 6C verification) ──")
+        for (strike, right), oi in top.items():
+            log.info("  strike=%-8.2f right=%-4s oi=%d", strike, right, int(oi))
+        log.info("──────────────────────────────────────────────────")
+    except Exception as e:
+        # 診断ログでメイン処理を巻き込まない
+        log.warning("Failed to log OI distribution (non-fatal): %s", e)
+
+
+# ──────────────────────────────────────────────────────────
 # メインフロー
 # ──────────────────────────────────────────────────────────
 
@@ -152,6 +188,12 @@ def run() -> None:
         logger.info("Saving to %s...", OUTPUT_PATH)
         entry = save_gex_result(result, path=OUTPUT_PATH)
         logger.info("Saved entry: %s", entry)
+
+        # ── 診断ログ（段階 6C 検証用、rest のときのみ）──
+        # 合格基準 E「Walls が大量 OI ストライクと整合」を Actions ログで
+        # 検証可能にするための追加情報。Mock では出力しない。
+        if source == "rest":
+            _log_oi_distribution(df, logger)
 
     finally:
         # REST Adapter の場合は httpx.Client を閉じる
