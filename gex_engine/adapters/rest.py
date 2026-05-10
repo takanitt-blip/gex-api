@@ -337,7 +337,12 @@ class ThetaRestAdapter:
                 body=csv_text[:500],
             )
 
-        return df[required].copy()
+        out = df[required].copy()
+        # 統一スキーマでは right ∈ {"call", "put"} の小文字。
+        # 実 ThetaData は CSV で "CALL" / "PUT" の大文字を返すため正規化。
+        # （v15 段階 6C 初回実行で発覚、誤判断18 として記録）
+        out["right"] = out["right"].astype(str).str.lower()
+        return out
 
     def _fetch_implied_volatility(self, symbol: str) -> pd.DataFrame:
         """IV snapshot を取得し、必要な列だけ取り出した DataFrame を返す。
@@ -374,7 +379,11 @@ class ThetaRestAdapter:
                 body=csv_text[:500],
             )
 
-        return df[required].copy()
+        out = df[required].copy()
+        # 統一スキーマでは right ∈ {"call", "put"} の小文字。
+        # 実 ThetaData は CSV で "CALL" / "PUT" の大文字を返すため正規化。
+        out["right"] = out["right"].astype(str).str.lower()
+        return out
 
     # ── 内部: 結合 ──
 
