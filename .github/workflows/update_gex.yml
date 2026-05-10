@@ -1,48 +1,26 @@
 name: Update GEX History
 
 # ─────────────────────────────────────────────────────────────
-# 段階 6C (v17): REST 切替と数値検証
+# 段階 6D (v17.3): cron 有効化 (運用開始)
 # ─────────────────────────────────────────────────────────────
-# このワークフローの責務:
-#   1. Java 25 セットアップ
-#   2. Theta Terminal v3 jar を公式 URL から動的 DL
-#   3. secrets.THETA_CREDS を creds.txt として配置
-#   4. Terminal をバックグラウンド起動
-#   5. ヘルスチェック (リトライループで起動完了を待つ)
-#   6. requirements.txt から依存パッケージをインストール
-#   7. テストを走らせて 195 tests pass を確認
-#   8. ★ REST Adapter で run_daily.py を実行し、実 SPY データから GEX 計算
-#   9. 実データの OI トップ 10 ストライクを診断ログに出力（合格基準 E 検証用）
-#  10. 差分があれば自動コミット & push
+# 段階 6D で変更したもの (v17.2 → v17.3):
+#   - cron をコメントアウトから有効化 (UTC 22:30)
+#   - コミットメッセージ: "stage 6C" → "stage 6D"
 #
-# 段階 6C で変更したもの (v16 → v17):
-#   - ヘッダーコメント: "段階 6B" → "段階 6C"
-#   - GEX_DATA_SOURCE: "mock" → "rest"
-#   - コミットメッセージ: "stage 6B" → "stage 6C"
+# 段階 6D 完了判定:
+#   2 営業日連続成功 (曜日依存・夜間ジョブの安定性確認)
 #
-# 段階 6C 初回実行で発覚した問題と修正 (v17.1 / v17.2):
+# 段階 6C 初回実行で発覚した問題と修正履歴 (v17.1 / v17.2):
 #   v17.1: --creds-file creds.txt を引数に明示
-#   v17.2: ★以下の 2 点を修正
-#     1. jar DL URL: download-latest.thetadata.us → download-unstable.thetadata.us/ThetaTerminalv3.jar
-#        (前者は v2 系列 v1.8.6 を返す、後者が v3 公式 URL)
-#     2. ヘルスチェック: /v3/stock/list/symbols → /v3/option/snapshot/open_interest
-#        (前者は Stock: FREE で叩ける偽陽性の原因、後者は本番と同じ)
-#
-# 段階 6C では:
-#   - cron はコメントアウトのまま (段階 6D で UTC 22:30 を有効化)
-#   - workflow_dispatch (手動実行) のみ有効
-#   - REST 切替で問題が出た場合は git revert で v16 に戻す
-#
-# 段階 6D で変更するもの:
-#   - cron: '30 22 * * 1-5' を有効化
+#   v17.2: jar URL を v3 用に変更、ヘルスチェックを本番エンドポイントに変更
 #
 # ─────────────────────────────────────────────────────────────
 
 on:
-  # ── 段階 6C ではコメントアウトのまま (段階 6D で有効化) ──
-  # schedule:
-  #   - cron: '30 22 * * 1-5'   # UTC 22:30 (ET 17:30 EDT / 18:30 EST)
-  workflow_dispatch:           # 手動実行で疎通確認
+  # ── 段階 6D で有効化 (v17.3) ──
+  schedule:
+    - cron: '30 22 * * 1-5'   # UTC 22:30 (ET 17:30 EDT / 18:30 EST)
+  workflow_dispatch:           # 手動実行も引き続き可能
 
 permissions:
   contents: write              # gex_history.json を commit & push するため
@@ -174,7 +152,7 @@ jobs:
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add gex_history.json
           git diff --quiet && git diff --staged --quiet \
-            || (git commit -m "Auto-update GEX history (rest, stage 6C)" && git push)
+            || (git commit -m "Auto-update GEX history (rest, stage 6D)" && git push)
 
       # ───── 後片付け (任意) ─────
       - name: Stop Theta Terminal
