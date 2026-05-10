@@ -20,6 +20,14 @@ name: Update GEX History
 #   - GEX_DATA_SOURCE: "mock" → "rest"
 #   - コミットメッセージ: "stage 6B" → "stage 6C"
 #
+# 段階 6C 初回実行で発覚した問題と修正 (v17.1 / v17.2):
+#   v17.1: --creds-file creds.txt を引数に明示
+#   v17.2: ★以下の 2 点を修正
+#     1. jar DL URL: download-latest.thetadata.us → download-unstable.thetadata.us/ThetaTerminalv3.jar
+#        (前者は v2 系列 v1.8.6 を返す、後者が v3 公式 URL)
+#     2. ヘルスチェック: /v3/stock/list/symbols → /v3/option/snapshot/open_interest
+#        (前者は Stock: FREE で叩ける偽陽性の原因、後者は本番と同じ)
+#
 # 段階 6C では:
 #   - cron はコメントアウトのまま (段階 6D で UTC 22:30 を有効化)
 #   - workflow_dispatch (手動実行) のみ有効
@@ -64,8 +72,15 @@ jobs:
 
       # ───── Theta Terminal セットアップ ─────
       - name: Download Theta Terminal v3 jar (from official URL)
+        # 公式ドキュメント (https://docs.thetadata.us/Articles/Getting-Started/Getting-Started.html)
+        # が指す v3 専用 URL を使用。
+        #
+        # ⚠️ 注意: download-latest.thetadata.us は v2 系列 (v1.8.6) を返すため
+        #         使えない。v3 用の URL は別系統 (download-unstable.thetadata.us)。
+        #         「unstable」という名称だが、公式ドキュメントが指している
+        #         現時点の v3 公式 DL URL である。
         run: |
-          curl -L -o ThetaTerminalv3.jar https://download-latest.thetadata.us
+          curl -L -o ThetaTerminalv3.jar https://download-unstable.thetadata.us/ThetaTerminalv3.jar
           ls -lh ThetaTerminalv3.jar
 
       - name: Configure creds.txt
@@ -82,21 +97,37 @@ jobs:
       - name: Start Theta Terminal in background
         # nohup でバックグラウンド起動、ログは theta_terminal.log に書き出す
         # 起動失敗時のデバッグのため、ログは後段で必ず確認する
+        #
+        # ★ v17.1 修正 (2026-05-10):
+        #   --creds-file creds.txt を明示的に指定する。
+        #   公式の起動仕様では「同じディレクトリに creds.txt を置く」だけでは
+        #   自動認識されず、引数で明示する必要がある。
+        #   段階 6C 初回実行時に "No line found" エラーで起動失敗したため、
+        #   公式 usage に従って明示指定する形に修正。
         run: |
           nohup java -jar ThetaTerminalv3.jar --creds-file creds.txt > theta_terminal.log 2>&1 &
           echo "Started Theta Terminal with PID $!"
           echo "$!" > theta_terminal.pid
 
       - name: Wait for Theta Terminal health check
-        # 最大 60 秒、1 秒ごとに /v3/stock/list/symbols を叩いて 200 を待つ
-        # 段階 6B-1 確認2 で「Stock: FREE 環境でも候補A は 200 で返る」と確認済み
+        # 最大 60 秒、1 秒ごとに本番エンドポイントを叩いて 200 を待つ。
         #
-        # curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
-        # || echo "000" は不要（付けると "000000" の二重出力になる）。
+        # ⚠️ v17.2 修正 (2026-05-10):
+        #   旧 yml では /v3/stock/list/symbols（Stock: FREE で叩ける軽量
+        #   エンドポイント）を使っていたが、これが偽陽性の原因だった。
+        #   段階 6B-2 で v2 jar が偶然 stock 系のヘルスチェックを通し、
+        #   段階 6C で初めて Option 系の REST API が叩けないと判明した。
+        #
+        #   修正: 本番で実際に使う /v3/option/snapshot/open_interest を
+        #   ヘルスチェックでも叩く。strike_range=1 で 1 ストライクだけに
+        #   絞ってリクエスト軽量化。
+        #
+        #   curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
+        #   || echo "000" は不要（付けると "000000" の二重出力になる）。
         run: |
           set +e  # curl 失敗時に即座に exit しない
           for i in $(seq 1 60); do
-            status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:25503/v3/stock/list/symbols?format=csv" 2>/dev/null)
+            status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:25503/v3/option/snapshot/open_interest?symbol=SPY&expiration=*&format=csv" 2>/dev/null)
             if [ "$status" = "200" ]; then
               echo "Theta Terminal is ready (took ${i} seconds)"
               exit 0
