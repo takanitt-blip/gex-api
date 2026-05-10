@@ -83,7 +83,7 @@ jobs:
         # nohup でバックグラウンド起動、ログは theta_terminal.log に書き出す
         # 起動失敗時のデバッグのため、ログは後段で必ず確認する
         run: |
-          nohup java -jar ThetaTerminalv3.jar > theta_terminal.log 2>&1 &
+          nohup java -jar ThetaTerminalv3.jar --creds-file creds.txt > theta_terminal.log 2>&1 &
           echo "Started Theta Terminal with PID $!"
           echo "$!" > theta_terminal.pid
 
