@@ -133,17 +133,17 @@
   },
   "2026.05.15": {
     "call_wall": 750.0,
-    "put_wall": 740.0,
-    "zero_gamma": 741.51,
-    "max_pain": 710.0,
-    "underlying_price": 740.64,
-    "total_gex": -4298261389,
+    "put_wall": 738.0,
+    "zero_gamma": 742.91,
+    "max_pain": 715.0,
+    "underlying_price": 739.69,
+    "total_gex": -5117410926,
     "regime": "trend",
     "regime_text": "トレンド相場・高ボラティリティ",
-    "timestamp": "2026-05-15T09:35:44Z",
+    "timestamp": "2026-05-15T15:56:46Z",
     "data_source": "rest",
     "symbol": "SPY",
     "as_of": "2026-05-15T00:00:00",
-    "n_contracts_used": 20061150
+    "n_contracts_used": 21672140
   }
 }
