@@ -1,0 +1,78 @@
+name: Step 1A - dump history raw
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install httpx
+        run: pip install httpx
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: Verify Java version
+        run: java -version
+
+      - name: Download Theta Terminal v3 jar (from official URL)
+        run: |
+          curl -L -o ThetaTerminalv3.jar https://download-unstable.thetadata.us/ThetaTerminalv3.jar
+          ls -lh ThetaTerminalv3.jar
+
+      - name: Configure creds.txt
+        run: |
+          printf '%s\n' "${{ secrets.THETA_CREDS }}" > creds.txt
+          wc -l creds.txt
+
+      - name: Start Theta Terminal in background
+        run: |
+          nohup java -jar ThetaTerminalv3.jar --creds-file creds.txt > theta_terminal.log 2>&1 &
+          echo "Started Theta Terminal with PID $!"
+          echo "$!" > theta_terminal.pid
+
+      - name: Wait for Theta Terminal health check
+        run: |
+          set +e  # curl 失敗時に即座に exit しない
+          for i in $(seq 1 60); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:25503/v3/option/snapshot/open_interest?symbol=SPY&expiration=*&format=csv" 2>/dev/null)
+            if [ "$status" = "200" ]; then
+              echo "Theta Terminal is ready (took ${i} seconds)"
+              exit 0
+            fi
+            echo "Attempt ${i}/60: HTTP $status, waiting..."
+            sleep 1
+          done
+          echo "❌ Theta Terminal did not become ready within 60 seconds"
+          echo "── theta_terminal.log (last 50 lines) ──"
+          tail -50 theta_terminal.log || true
+          exit 1
+
+      - name: Show Theta Terminal startup log (for confirmation)
+        run: |
+          echo "── theta_terminal.log (head 30 lines) ──"
+          head -30 theta_terminal.log
+
+      - name: Run history dump
+        run: python tools/dump_history_raw.py
+
+      - name: Upload raw dump as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-dump
+          path: history_dump/
+          if-no-files-found: warn
