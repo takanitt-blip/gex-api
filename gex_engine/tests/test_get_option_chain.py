@@ -1,0 +1,325 @@
+"""get_option_chain のエンドツーエンドテスト（Step 5）。
+
+calendar → greeks/eod → open_interest → merge → coerce の全経路を
+respx でモックして検証する。フィクスチャは実 API ダンプ由来。
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date
+from pathlib import Path
+
+import httpx
+import pytest
+import respx
+
+from gex_engine import schema
+from gex_engine.adapters.rest import ThetaRestAdapter
+
+BASE_URL = "http://127.0.0.1:25503/v3"
+ON_DATE_URL = f"{BASE_URL}/calendar/on_date"
+GREEKS_EOD_URL = f"{BASE_URL}/option/history/greeks/eod"
+OI_HISTORY_URL = f"{BASE_URL}/option/history/open_interest"
+
+FIXTURES = Path(__file__).parent / "fixtures"
+GREEKS_EOD_NORMAL = (FIXTURES / "greeks_eod_normal.csv").read_text()
+GREEKS_EOD_PARTIAL = (FIXTURES / "greeks_eod_partial.csv").read_text()
+OI_NORMAL = (FIXTURES / "oi_normal.csv").read_text()
+
+CSV_OPEN = 'type,open,close\n"open","09:30:00","16:00:00"\n\n'
+
+
+@pytest.fixture
+def adapter() -> ThetaRestAdapter:
+    return ThetaRestAdapter(max_retries=2, retry_backoff_base=0.0)
+
+
+def _mock_all_open() -> None:
+    """全 calendar/on_date 問い合わせを open で返す（平日のみのシナリオ）。"""
+    respx.get(ON_DATE_URL).mock(
+        return_value=httpx.Response(200, text=CSV_OPEN)
+    )
+
+
+# ── 正常系：エンドツーエンド ──
+
+@respx.mock
+def test_get_option_chain_happy_path(adapter: ThetaRestAdapter) -> None:
+    """全経路が通り、統一スキーマの DataFrame が返る。
+
+    greeks_eod_normal(12行→IVフィルタで8行) と oi_normal(12行) を
+    4列キーで join。両側揃うのは normal 8 ストライク。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    # 両側揃う 8 行（normal）。iv_zero/iv_err100 は IV 側に無く left_only。
+    assert len(df) == 8
+    # 統一スキーマの必須9列
+    assert set(df.columns) == set(schema.REQUIRED_DTYPES.keys())
+
+
+@respx.mock
+def test_get_option_chain_passes_schema_validation(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """出力が schema.validate() を通る（dtype・値レベル）。"""
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    result = schema.validate(df)
+    assert result.is_valid, f"errors: {result.errors}"
+
+
+@respx.mock
+def test_get_option_chain_dtype_coercion(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """coerce_to_schema により必須列の dtype が変換される。"""
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    for col, dtype in schema.REQUIRED_DTYPES.items():
+        assert str(df[col].dtype) == dtype, f"{col}: {df[col].dtype}"
+
+
+# ── 日付の解決と非対称性 ──
+
+@respx.mock
+def test_get_option_chain_date_asymmetry(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """greeks/eod は T、open_interest は T翌営業日を date に渡す。
+
+    as_of=5/14(木) → T=5/13(水)、oi_date=5/14(木)。
+    """
+    _mock_all_open()
+    iv_route = respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    oi_route = respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    iv_params = iv_route.calls.last.request.url.params
+    oi_params = oi_route.calls.last.request.url.params
+    # greeks/eod は取引日 T = 5/13
+    assert iv_params["start_date"] == "20260513"
+    assert iv_params["end_date"] == "20260513"
+    # open_interest は T翌営業日 = 5/14
+    assert oi_params["date"] == "20260514"
+
+
+# ── 空レスポンス ──
+
+@respx.mock
+def test_get_option_chain_empty_greeks_returns_empty(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """greeks/eod が空なら空の統一スキーマ DataFrame を返す。"""
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text="")
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    assert df.empty
+    assert set(df.columns) == set(schema.REQUIRED_DTYPES.keys())
+
+
+@respx.mock
+def test_get_option_chain_empty_oi_returns_empty(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """open_interest が空なら空の統一スキーマ DataFrame を返す。"""
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text="")
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    assert df.empty
+
+
+# ── Step 3b: サイレント Wall 欠落の事実ログ ──
+
+@respx.mock
+def test_get_option_chain_logs_silent_wall_loss(
+    adapter: ThetaRestAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """left_only（OI あり・IV なし）の OI 規模が INFO ログに出る。
+
+    iv_zero K=550(OI=12325) / K=335(OI=9) と iv_err100 K=985,990 は
+    IV フィルタで落ち、OI 側には残るため left_only になる。
+    特に K=550 は OI が大きく、Wall 欠落リスクの観察対象。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    with caplog.at_level(logging.INFO):
+        adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    wall_logs = [
+        r for r in caplog.records
+        if "OI but no usable IV" in r.message
+    ]
+    assert len(wall_logs) == 1
+    rec = wall_logs[0]
+    assert rec.levelno == logging.INFO
+    # IV フィルタで落ちた 4 ストライク（335,550,985,990 CALL）
+    assert "4 strike(s)" in rec.message
+    # lost OI = 9 + 12325 + 3300 + 3453 = 19087
+    assert "19087" in rec.message
+
+
+@respx.mock
+def test_get_option_chain_partial_merge(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """greeks_eod_partial（K=718 欠落）でも両側揃う行のみ返る。
+
+    greeks_eod_partial は K=718 CALL/PUT を抜いた 10 行（→IVフィルタ後6行）。
+    oi_normal は 12 行（K=718 含む）。両側揃うのは normal 6 ストライク。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_PARTIAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    # normal 8 - K=718 の 2 = 6 行
+    assert len(df) == 6
+    strikes = set(df["strike"].astype(float))
+    assert 718.0 not in strikes
+
+
+# ── 営業日の遡及が get_option_chain 経由でも効く ──
+
+@respx.mock
+def test_get_option_chain_resolves_through_weekend(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """as_of が月曜なら T は前金曜（土日を遡及）。
+
+    as_of=2026-05-18(月): T 解決で 5/17(日)・5/16(土)を飛ばし 5/15(金)。
+    oi_date 解決で 5/16(土)・5/17(日)を飛ばし 5/18(月)。
+    """
+    def on_date_router(request: httpx.Request) -> httpx.Response:
+        d = request.url.params["date"]
+        weekend = {"20260516", "20260517"}
+        t = "weekend" if d in weekend else "open"
+        body = (
+            f'type,open,close\n"{t}",,\n\n' if t == "weekend"
+            else CSV_OPEN
+        )
+        return httpx.Response(200, text=body)
+
+    respx.get(ON_DATE_URL).mock(side_effect=on_date_router)
+    iv_route = respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    oi_route = respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    adapter.get_option_chain("SPY", date(2026, 5, 18))
+
+    # T = 5/15(金)
+    assert iv_route.calls.last.request.url.params["start_date"] == "20260515"
+    # oi_date = 5/18(月)
+    assert oi_route.calls.last.request.url.params["date"] == "20260518"
+
+
+# ── 監査15: symbol 不一致の検出 ──
+
+@respx.mock
+def test_get_option_chain_symbol_mismatch_raises(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """引数 symbol と取得データの symbol が食い違うと ThetaFatalError。
+
+    "QQQ" を要求したが、上流（greeks/eod・open_interest）が
+    両方 SPY フィクスチャを返すシナリオ。両側 SPY で join 成立し、
+    merged の symbol は SPY。引数 QQQ と不一致 → FATAL。
+    監査15 が想定した「銘柄取り違え」の検出。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    from gex_engine.adapters.rest import ThetaFatalError
+    with pytest.raises(ThetaFatalError, match="symbol mismatch"):
+        adapter.get_option_chain("QQQ", date(2026, 5, 14))
+
+
+# ── 監査14: マッチゼロの検出 ──
+
+@respx.mock
+def test_get_option_chain_zero_match_logs_and_returns_empty(
+    adapter: ThetaRestAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """IV/OI 両方非空だがキーが 1 つも一致しないと WARNING + 空 df。
+
+    OI 側の expiration を別の満期に改変し、greeks/eod 側
+    （2026-06-18）と一致しないようにする。both 行ゼロ。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    # OI の expiration を 2026-06-18 → 2026-07-17 に置換（満期不一致）
+    oi_mismatched = OI_NORMAL.replace("2026-06-18", "2026-07-17")
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=oi_mismatched)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    assert df.empty
+    assert set(df.columns) == set(schema.REQUIRED_DTYPES.keys())
+    zero_match_logs = [
+        r for r in caplog.records
+        if "no keys matched" in r.message
+    ]
+    assert len(zero_match_logs) == 1
+    assert zero_match_logs[0].levelno == logging.WARNING
