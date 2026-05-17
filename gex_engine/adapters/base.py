@@ -46,7 +46,11 @@ class DataFetcher(Protocol):
 
         Args:
             symbol: 取得対象シンボル（例: "SPY"）
-            as_of: 基準日。EOD 計算では「前営業日」を渡す想定。
+            as_of: 処理基準日（通常は実行日 today）。
+                   EOD データの取得において「どの取引日のデータが
+                   必要か」への変換（前営業日への調整等）は、各 Adapter が
+                   必要に応じて内部で行う。呼び出し側は素直に処理基準日を
+                   渡せばよい（DESIGN_history_rest_adapter.md 4.2）。
 
         Returns:
             schema.REQUIRED_DTYPES に準拠した DataFrame。
