@@ -1,6 +1,16 @@
 name: Update GEX History
 
 # ─────────────────────────────────────────────────────────────
+# v18: snapshot → history 全面移行に伴う修正
+# ─────────────────────────────────────────────────────────────
+# rest.py が snapshot から history エンドポイントへ全面再設計された
+# (DESIGN_history_rest_adapter.md)。これに伴う yml 側の修正:
+#   - ヘルスチェックの URL を snapshot/open_interest から
+#     history/greeks/eod に変更（後述、誤判断16 の教訓）
+#   - cron 根拠コメントから snapshot キャッシュリセットの記述を削除
+# cron 時刻 (UTC 21:47) 自体は変更不要（理由は下記）。
+#
+# ─────────────────────────────────────────────────────────────
 # 段階 6D (v17.4): cron 時刻の高負荷帯回避調整
 # ─────────────────────────────────────────────────────────────
 # 段階 6D で変更したもの (v17.3 → v17.4):
@@ -17,10 +27,14 @@ name: Update GEX History
 #      (e.g., midnight UTC) may be delayed or, if load is
 #      sufficiently high, potentially dropped."
 #
-#   設計上の取得可能窓 (前営業日 EOD を取れる時間帯) は
-#   UTC 20:00 (ET 16:00 取引終了) 〜 翌 UTC 04:00
-#   (ET 00:00 ThetaData snapshot キャッシュリセット) まで。
-#   この窓内で混雑帯を避けた時刻として UTC 21:47 を選定。
+#   設計上の取得可能窓:
+#   history/greeks/eod は ET 17:15 に生成される確定 EOD レポートを返す。
+#   snapshot と違い深夜キャッシュリセットの概念は無く、いつ叩いても
+#   同じ値が返る（実行時刻非依存、DESIGN_history_rest_adapter.md 1）。
+#   さらに rest.py は取引日 T を「前営業日」に倒す設計のため、当日 EOD
+#   の生成タイミングにも依存しない。
+#   したがって cron 時刻の制約は「GitHub Actions の混雑帯を避ける」
+#   ことだけ。この観点で混雑帯を外した時刻として UTC 21:47 を選定。
 #
 #   分を 47 にしたのは「キリの良い数字 (0/15/30/45) は
 #   他のジョブと衝突しやすい」という GitHub Actions コミュニティの
@@ -114,17 +128,38 @@ jobs:
         #   エンドポイント）を使っていたが、これが偽陽性の原因だった。
         #   段階 6B-2 で v2 jar が偶然 stock 系のヘルスチェックを通し、
         #   段階 6C で初めて Option 系の REST API が叩けないと判明した。
+        #   （誤判断16: ヘルスチェック = 本番で使うエンドポイントが
+        #     叩けることの確認であるべき）
         #
-        #   修正: 本番で実際に使う /v3/option/snapshot/open_interest を
-        #   ヘルスチェックでも叩く。strike_range=1 で 1 ストライクだけに
-        #   絞ってリクエスト軽量化。
+        # ⚠️ v18 修正 (snapshot → history 移行):
+        #   rest.py が history 化され、本番は snapshot を一切叩かなくなった。
+        #   ヘルスチェックも本番が叩く history エンドポイントに合わせる。
+        #   合わせないと「snapshot は叩けるが history 系で 471 PERMISSION」
+        #   を見逃し、誤判断16 の偽陽性が再発する。
+        #
+        #   採用: /v3/option/history/greeks/eod。
+        #     理由: history 化後の本番の中核（IV 健全性フィルタの本丸）。
+        #           Options: STANDARD 権限が無いと 471 を返すため、
+        #           プラン権限の確認にもなる。
+        #     軽量化: expiration を 1 満期に絞る。expiration=* は
+        #             36 満期 約 6 MB を返し、60 回ループで重い。
+        #     date 固定: start_date=end_date=20260512 は「ヘルスチェック
+        #             専用の固定過去営業日」。本番の取得日とは無関係で、
+        #             権限と疎通の確認が目的。history なので過去日付の
+        #             データは安定して返る。
+        #
+        #   ⚠️ 実装後検証項目: 固定の expiration=2026-06-18 は 2026-06 に
+        #     満期を迎える。満期後も history/greeks/eod が「過去満期の
+        #     過去データ」を返すかは実機で要確認。返さなくなった場合は
+        #     ヘルスチェックの固定満期を、より新しい満期に更新する。
         #
         #   curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
         #   || echo "000" は不要（付けると "000000" の二重出力になる）。
         run: |
           set +e  # curl 失敗時に即座に exit しない
+          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=2026-06-18&start_date=20260512&end_date=20260512&format=csv"
           for i in $(seq 1 60); do
-            status=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:25503/v3/option/snapshot/open_interest?symbol=SPY&expiration=*&format=csv" 2>/dev/null)
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
             if [ "$status" = "200" ]; then
               echo "Theta Terminal is ready (took ${i} seconds)"
               exit 0
