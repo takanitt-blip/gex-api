@@ -103,15 +103,28 @@ def test_get_option_chain_dtype_coercion(
         assert str(df[col].dtype) == dtype, f"{col}: {df[col].dtype}"
 
 
-# ── 日付の解決と非対称性 ──
+# ── 日付の解決（両エンドポイントとも T を使う）──
 
 @respx.mock
-def test_get_option_chain_date_asymmetry(
+def test_get_option_chain_uses_T_for_both_endpoints(
     adapter: ThetaRestAdapter,
 ) -> None:
-    """greeks/eod は T、open_interest は T翌営業日を date に渡す。
+    """greeks/eod と open_interest の両方に同じ取引日 T を渡す。
 
-    as_of=5/14(木) → T=5/13(水)、oi_date=5/14(木)。
+    as_of=5/14(木) → T=5/13(水)。両エンドポイントとも date=20260513。
+
+    2026-05-19 訂正履歴:
+        旧実装は open_interest の date に「T の翌営業日」を渡しており、
+        旧テスト test_get_option_chain_date_asymmetry は oi date を
+        "20260514"(=T+1) でアサートしていた。これは DESIGN セクション
+        2.1 / 3.4 が公式ドキュメントの一文 "The reported open interest
+        represents the open interest at the end of the previous trading
+        day." を OPRA 報告タイミングの説明として読まず、API パラメータ
+        仕様と取り違えた誤読に基づくものだった。
+        正しい挙動は「date に渡した日 = 欲しい取引日そのもの」
+        （greeks/eod と同じ規約）。2026-05-19 実行で date=今日 を
+        渡したところ 400 "Cannot fetch current-day data" を観測し、
+        誤読が一次証拠で確定して是正。
     """
     _mock_all_open()
     iv_route = respx.get(GREEKS_EOD_URL).mock(
@@ -125,11 +138,10 @@ def test_get_option_chain_date_asymmetry(
 
     iv_params = iv_route.calls.last.request.url.params
     oi_params = oi_route.calls.last.request.url.params
-    # greeks/eod は取引日 T = 5/13
+    # 両エンドポイントとも取引日 T = 5/13 を使う
     assert iv_params["start_date"] == "20260513"
     assert iv_params["end_date"] == "20260513"
-    # open_interest は T翌営業日 = 5/14
-    assert oi_params["date"] == "20260514"
+    assert oi_params["date"] == "20260513"
 
 
 # ── 空レスポンス ──
@@ -236,7 +248,7 @@ def test_get_option_chain_resolves_through_weekend(
     """as_of が月曜なら T は前金曜（土日を遡及）。
 
     as_of=2026-05-18(月): T 解決で 5/17(日)・5/16(土)を飛ばし 5/15(金)。
-    oi_date 解決で 5/16(土)・5/17(日)を飛ばし 5/18(月)。
+    両エンドポイントとも date=20260515 を使う（2026-05-19 訂正以降）。
     """
     def on_date_router(request: httpx.Request) -> httpx.Response:
         d = request.url.params["date"]
@@ -258,10 +270,9 @@ def test_get_option_chain_resolves_through_weekend(
 
     adapter.get_option_chain("SPY", date(2026, 5, 18))
 
-    # T = 5/15(金)
+    # 両エンドポイントとも T = 5/15(金)
     assert iv_route.calls.last.request.url.params["start_date"] == "20260515"
-    # oi_date = 5/18(月)
-    assert oi_route.calls.last.request.url.params["date"] == "20260518"
+    assert oi_route.calls.last.request.url.params["date"] == "20260515"
 
 
 # ── 監査15: symbol 不一致の検出 ──
