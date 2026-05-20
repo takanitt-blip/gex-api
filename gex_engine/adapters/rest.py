@@ -15,13 +15,24 @@ PROJECT_CONTEXT の Adapter パターンに従い、DataFetcher Protocol を
         FATAL:      上記以外 → 即 raise
 
 データ取得フロー（history ベース、DESIGN_history_rest_adapter.md）:
-    1. as_of から取引日 T と OI 用日付を算出（calendar/on_date）
-    2. /v3/option/history/greeks/eod（取引日 T）
+    1. as_of から取引日 T を算出（calendar/on_date による直近過去営業日）
+    2. /v3/option/history/greeks/eod（start_date=end_date=T）
        → IV 健全性フィルタ（implied_vol<=0 / iv_error==100 を除外）
-    3. /v3/option/history/open_interest（T の翌営業日を date に渡す）
+    3. /v3/option/history/open_interest（date=T）
     4. (symbol, expiration, strike, right) で outer join
     5. 片側欠落を診断ログに記録し、両側揃ったレコードのみに絞る
     6. 統一スキーマに dtype 整形して返す
+
+    日付規約の訂正履歴（2026-05-19）:
+        旧実装は open_interest の date に「T の翌営業日」を渡していた。
+        これは DESIGN 2.1 が公式ドキュメントの一文 "The reported open
+        interest represents the open interest at the end of the previous
+        trading day." を誤読した結果である。同文は OPRA の毎朝06:30ET
+        報告のタイミング(レポート時刻から見て"前日"のEOD)を述べたもので、
+        date パラメータの意味の説明ではない。公式の正しい挙動は
+        「date に渡した日 = 欲しい取引日そのもの」。greeks/eod と同じ規約。
+        2026-05-19 実行で oi_date=今日 になり 400 "Cannot fetch
+        current-day data" を踏んだ結果、誤読が判明し是正。
 
 snapshot → history への移行理由:
     snapshot は「叩いた瞬間の最新値」を返すため cron 遅延でデータが
@@ -190,14 +201,14 @@ class ThetaRestAdapter:
         history/greeks/eod と history/open_interest を取得し、
         4 列キーで結合して統一スキーマに整形する。
 
-        日付の解決（DESIGN 3 / 4.1）:
+        日付の解決（DESIGN 3 / 4.1、2026-05-19 訂正）:
             as_of は処理基準日（通常は run_daily.py が渡す today）。
-            この関数が内部で取引日 T と OI 用日付を算出する:
-              T       = as_of の直近過去営業日（_resolve_trade_date）
-              oi_date = T の翌営業日（_next_business_day）
-            greeks/eod は T を、open_interest は oi_date を使う。
-            この日付の非対称性は OPRA の OI 報告構造に由来し（DESIGN 3.5）、
-            ここ 1 箇所に集約することで管理する。
+            この関数が内部で取引日 T を算出する:
+              T = as_of の直近過去営業日（_resolve_trade_date）
+            greeks/eod と open_interest の両方に同じ T を渡す。
+            旧実装は OI に「T の翌営業日」を渡していたが、これは
+            公式ドキュメントの誤読であり、両エンドポイントとも
+            date = T が正しい（ファイル冒頭 docstring の訂正履歴参照）。
 
         Args:
             symbol: シンボル（例: "SPY"）
@@ -212,12 +223,14 @@ class ThetaRestAdapter:
             ThetaFatalError: FATAL カテゴリ全般・カレンダー異常
             ThetaRetryExhaustedError: RETRYABLE 枯渇
         """
-        # ── 取引日 T と OI 用日付の解決 ──
+        # ── 取引日 T の解決 ──
+        # 旧実装は oi_date = _next_business_day(trade_date) も算出していたが、
+        # これは「OI は前営業日 EOD が返る」という公式ドキュメント誤読に
+        # 基づく補正で、廃止（2026-05-19 訂正）。両エンドポイントとも T を渡す。
         trade_date = self._resolve_trade_date(as_of)
-        oi_date = self._next_business_day(trade_date)
         logger.info(
-            "ThetaRestAdapter: %s as_of=%s -> trade_date=%s, oi_date=%s",
-            symbol, as_of, trade_date, oi_date,
+            "ThetaRestAdapter: %s as_of=%s -> trade_date=%s",
+            symbol, as_of, trade_date,
         )
 
         # ── greeks/eod（取引日 T）──
@@ -230,13 +243,13 @@ class ThetaRestAdapter:
             )
             return empty_dataframe()
 
-        # ── open_interest（T の翌営業日を date に渡す）──
-        oi_df = self._fetch_open_interest(symbol, oi_date)
+        # ── open_interest（取引日 T、greeks/eod と同じ日付）──
+        oi_df = self._fetch_open_interest(symbol, trade_date)
         if oi_df.empty:
             logger.warning(
-                "open_interest returned empty for %s (oi_date=%s). "
+                "open_interest returned empty for %s (trade_date=%s). "
                 "Returning empty chain.",
-                symbol, oi_date,
+                symbol, trade_date,
             )
             return empty_dataframe()
 
@@ -369,8 +382,7 @@ class ThetaRestAdapter:
     # ── 内部: 営業日カレンダー ──
     #
     # history への移行に伴い新設。snapshot 時代には不要だった。
-    # 取引日 T の解決（_resolve_trade_date / _next_business_day）が
-    # この低レベル取得関数を使う。
+    # 取引日 T の解決（_resolve_trade_date）がこの低レベル取得関数を使う。
     #
     # 実 API レスポンス形式（2026-05-16 に on_date を実機ダンプして確認）:
     #     type,open,close
@@ -475,8 +487,8 @@ class ThetaRestAdapter:
     _TRADING_DAY_TYPES: frozenset[str] = frozenset({"open", "early_close"})
 
     # カレンダー走査の上限日数（無限ループ防止のサーキットブレーカー）。
-    # _resolve_trade_date（過去向き）と _next_business_day（未来向き）の
-    # 両方で共用する。米国市場の最長連続休場は年末年始の土日 + 元日でも
+    # _resolve_trade_date（過去向き）が使う。
+    # 米国市場の最長連続休場は年末年始の土日 + 元日でも
     # 3〜4 日程度。10 はそれを十分上回る安全マージン。この上限に達する
     # ことは「真の異常」（カレンダー API の不整合等）を意味するため、
     # 値の精度は問われない（7 でも 14 でも正常系の挙動は不変）。
@@ -523,58 +535,10 @@ class ThetaRestAdapter:
             status_code=200,
         )
 
-    def _next_business_day(self, target: date) -> date:
-        """target の「翌営業日」を解決する。
-
-        DESIGN 3.4 の日付非対称性に対応するための部品。
-        open_interest は「date に渡した日の前営業日 EOD」を返す規約のため、
-        取引日 T の OI が欲しい場合は date に「T の翌営業日」を渡す必要がある。
-
-        _resolve_trade_date の鏡像（過去遡及ではなく未来探索）。
-
-        Args:
-            target: 起点の日付（通常は _resolve_trade_date が返した T）。
-
-        Returns:
-            target より後の直近の取引日（open または early_close）。
-
-        Raises:
-            ThetaFatalError:
-                _MAX_CALENDAR_SCAN_DAYS 日進んでも取引日が
-                見つからない場合（カレンダー異常）。
-            ThetaPermissionError / ThetaRetryExhaustedError:
-                _fetch_calendar_on_date から伝播。
-
-        Note:
-            未来方向の探索のため、on_date の対応範囲（2012-01-01 〜
-            翌年末）の上端境界に近づく可能性がある。実運用では target は
-            T（直近過去営業日）であり翌営業日は today 近傍なので
-            通常は境界を踏まないが、範囲外を踏んだ際の on_date の挙動は
-            実装後検証項目（DESIGN セクション6）として残る。
-        """
-        candidate = target + timedelta(days=1)
-        for _ in range(self._MAX_CALENDAR_SCAN_DAYS):
-            # 監査7: on_date レスポンスに date 列が無いため candidate を併記。
-            schedule_type = self._fetch_calendar_on_date(candidate)
-            logger.info(
-                "next_business_day: candidate=%s type=%s",
-                candidate, schedule_type,
-            )
-            if schedule_type in self._TRADING_DAY_TYPES:
-                return candidate
-            candidate += timedelta(days=1)
-
-        raise ThetaFatalError(
-            f"_next_business_day: no trading day found within "
-            f"{self._MAX_CALENDAR_SCAN_DAYS} days after {target}. "
-            f"Calendar data may be inconsistent.",
-            status_code=200,
-        )
-
     # ── 内部: 個別エンドポイント ──
 
     def _fetch_open_interest(
-        self, symbol: str, oi_date: date
+        self, symbol: str, trade_date: date
     ) -> pd.DataFrame:
         """history/open_interest を取得し、必要列の DataFrame を返す。
 
@@ -582,18 +546,23 @@ class ThetaRestAdapter:
 
         endpoint: /option/history/open_interest
 
-        日付の非対称性（DESIGN 3.4 / 3.5）:
-            OI は「date に渡した日の前営業日 EOD」を返す規約（OPRA が
-            毎朝 06:30 ET に前営業日値を報告する構造に由来）。
-            このため、取引日 T の OI が欲しい場合、呼び出し側は
-            oi_date に「T の翌営業日」を渡す。この関数自身は日付を
-            解釈せず、渡された oi_date をそのまま date パラメータにする。
-            非対称性の管理は get_option_chain に集約する。
+        日付規約（2026-05-19 訂正）:
+            date パラメータには「欲しい取引日そのもの」を渡す。
+            greeks/eod と同じ規約。旧実装は「T の翌営業日」を渡していたが、
+            これは公式ドキュメントの一文を OPRA 報告タイミングの説明と
+            混同した誤読だった（ファイル冒頭 docstring の訂正履歴参照）。
+
+            正しい挙動の根拠:
+            - 公式ドキュメント "Returns open interest for an option
+              contract between the specified dates (inclusive)"
+              ── start_date/end_date は "指定した日付の範囲そのもの"。
+            - 2026-05-19 実行で date=今日 を渡したところ
+              "Cannot fetch current-day data" の 400 を観測。
+              ThetaData は date を「欲しい取引日そのもの」と解釈している。
 
         Args:
             symbol: 取得対象シンボル。
-            oi_date: date パラメータにそのまま渡す日付
-                     （= 取得したい取引日 T の翌営業日）。
+            trade_date: 取得したい取引日 T。date パラメータにそのまま渡す。
 
         Returns:
             列: symbol, expiration, strike, right, open_interest
@@ -607,7 +576,7 @@ class ThetaRestAdapter:
             {
                 "symbol": symbol,
                 "expiration": "*",
-                "date": oi_date.strftime("%Y%m%d"),
+                "date": trade_date.strftime("%Y%m%d"),
             },
         )
         if not csv_text.strip():
