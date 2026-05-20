@@ -283,113 +283,19 @@ def test_resolve_trade_date_lookback_boundary(
 
 
 # ──────────────────────────────────────────────────────────
-# Step 2-3: _next_business_day
+# 旧 Step 2-3: _next_business_day（2026-05-19 削除）
 # ──────────────────────────────────────────────────────────
-
-@respx.mock
-def test_next_business_day_simple(adapter: ThetaRestAdapter) -> None:
-    """target が平日 → 翌日（平日）を返す。
-
-    2026-05-14(木) の翌営業日は 5/15(金)。
-    """
-    _mock_calendar({"20260515": "open"})
-    result = adapter._next_business_day(date(2026, 5, 14))
-    assert result == date(2026, 5, 15)
-
-
-@respx.mock
-def test_next_business_day_skips_weekend(adapter: ThetaRestAdapter) -> None:
-    """target が金曜 → 土日を飛ばして翌月曜を返す。
-
-    2026-05-15(金) の翌は 5/16(土)→5/17(日)→5/18(月/open)。
-    """
-    _mock_calendar({
-        "20260516": "weekend",
-        "20260517": "weekend",
-        "20260518": "open",
-    })
-    result = adapter._next_business_day(date(2026, 5, 15))
-    assert result == date(2026, 5, 18)
-
-
-@respx.mock
-def test_next_business_day_skips_holiday_long_weekend(
-    adapter: ThetaRestAdapter,
-) -> None:
-    """祝日 + 土日の連続休場を飛ばして翌取引日を返す。
-
-    金曜が target、翌が土・日、月曜が祝日(full_close)、火曜が取引日。
-    """
-    _mock_calendar({
-        "20260524": "weekend",     # 土
-        "20260525": "weekend",     # 日
-        "20260526": "full_close",  # 月（祝日想定）
-        "20260527": "open",        # 火
-    })
-    result = adapter._next_business_day(date(2026, 5, 23))
-    assert result == date(2026, 5, 27)
-
-
-@respx.mock
-def test_next_business_day_early_close_is_trading_day(
-    adapter: ThetaRestAdapter,
-) -> None:
-    """early_close（短縮営業日）は翌営業日として返される。"""
-    _mock_calendar({"20251127": "early_close"})
-    result = adapter._next_business_day(date(2025, 11, 26))
-    assert result == date(2025, 11, 27)
-
-
-@respx.mock
-def test_next_business_day_does_not_use_target_itself(
-    adapter: ThetaRestAdapter,
-) -> None:
-    """target 当日は問い合わせず、必ず翌日から探索する。
-
-    target 当日が open でも、それは返さない。翌日を見る。
-    """
-    route_target = respx.get(
-        ON_DATE_URL, params={"date": "20260514"}
-    ).mock(return_value=httpx.Response(200, text=_csv_for("open")))
-    _mock_calendar({"20260515": "open"})
-
-    result = adapter._next_business_day(date(2026, 5, 14))
-    assert result == date(2026, 5, 15)
-    assert not route_target.called
-
-
-@respx.mock
-def test_next_business_day_exhausts_scan(
-    adapter: ThetaRestAdapter,
-) -> None:
-    """上限日数を超えて取引日が見つからない場合は ThetaFatalError。"""
-    respx.get(ON_DATE_URL).mock(
-        return_value=httpx.Response(200, text=_csv_for("weekend"))
-    )
-    with pytest.raises(ThetaFatalError, match="no trading day found"):
-        adapter._next_business_day(date(2026, 5, 15))
-
-
-@respx.mock
-def test_resolve_and_next_are_asymmetric(
-    adapter: ThetaRestAdapter,
-) -> None:
-    """DESIGN 3.5 の日付非対称性の確認。
-
-    同じ取引日 T に対し、resolve は過去、next は未来へ進む。
-    T=2026-05-15(金) を中心に:
-      _resolve_trade_date(5/18(月)) → 5/15  (過去へ)
-      _next_business_day(5/15)      → 5/18  (未来へ)
-    両者は逆方向であり、結果が一致しないことを明示的に確認。
-    """
-    _mock_calendar({
-        "20260517": "weekend",
-        "20260516": "weekend",
-        "20260515": "open",
-        "20260518": "open",
-    })
-    t = adapter._resolve_trade_date(date(2026, 5, 18))
-    nxt = adapter._next_business_day(t)
-    assert t == date(2026, 5, 15)
-    assert nxt == date(2026, 5, 18)
-    assert t != nxt
+# rest.py の日付規約バグ修正（公式ドキュメントの誤読に基づく
+# 「OI は date の前営業日が返る」を是正、両エンドポイントとも
+# date=T に統一）に伴い、_next_business_day メソッド自体が
+# 削除された。このため本セクションの 7 テストも削除:
+#   test_next_business_day_simple
+#   test_next_business_day_skips_weekend
+#   test_next_business_day_skips_holiday_long_weekend
+#   test_next_business_day_early_close_is_trading_day
+#   test_next_business_day_does_not_use_target_itself
+#   test_next_business_day_exhausts_scan
+#   test_resolve_and_next_are_asymmetric
+# 「日付の非対称性」（test_resolve_and_next_are_asymmetric の
+# 検証対象）は誤読由来の概念だったため、テストごと削除する
+# のが正しい（PC_GOVERNANCE 4.1 / 誤判断15 系統）。
