@@ -31,6 +31,7 @@ from ..adapters.mock import MockDataFetcher
 from ..adapters.rest import ThetaRestAdapter
 from ..core.gex import calculate_all
 from ..io_layer import save_gex_result
+from ..io_layer.serializer import scale_total_gex
 
 
 # ──────────────────────────────────────────────────────────
@@ -176,11 +177,24 @@ def run() -> None:
         # ── GEX 計算 ──
         logger.info("Calculating GEX...")
         result = calculate_all(df, as_of=today, data_source=fetcher.source_name)
+
+        # JSON 出力時のスケール変換と同じ計算をログでも行う
+        # （obs.A 是正: ログと JSON の同名フィールドの単位差を解消）
+        # - total_gex_scaled: JSON の "total_gex" と完全一致する単位（× S^2 × 0.01）
+        # - total_gex_raw:    Core Logic の素の出力（γ × OI × 100 の合計）
+        # serializer.py の _to_int_or_none と同じく int(round(...)) で整数化し、
+        # JSON 値との末尾ズレ（0.5 丸め）を消す。
+        scaled_total_gex = int(round(
+            scale_total_gex(result.total_gex, result.underlying_price)
+        ))
+
         logger.info(
-            "GEX result: spot=%.2f CW=%s PW=%s ZG=%.2f MP=%s total=%.2f",
+            "GEX result: spot=%.2f CW=%s PW=%s ZG=%.2f MP=%s "
+            "total_gex_scaled=%d total_gex_raw=%.2f",
             result.underlying_price,
             result.call_wall, result.put_wall,
             result.zero_gamma, result.max_pain,
+            scaled_total_gex,
             result.total_gex,
         )
 
