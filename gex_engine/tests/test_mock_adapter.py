@@ -126,16 +126,20 @@ class TestRealisticStructure:
 
 class TestReproducibility:
     def test_same_seed_produces_identical_output(self):
-        df1 = generate_option_chain(seed=42)
-        df2 = generate_option_chain(seed=42)
+        # trade_date を明示固定（誤判断25 以降、generate_option_chain に
+        # trade_date 引数あり。None だと内部で today() を呼ぶため、
+        # 日付をまたぐ実行で値が変わる可能性がある）
+        fixed = date(2026, 1, 1)
+        df1 = generate_option_chain(seed=42, trade_date=fixed)
+        df2 = generate_option_chain(seed=42, trade_date=fixed)
         pd.testing.assert_frame_equal(df1, df2)
 
     def test_different_seeds_produce_different_output(self):
-        df1 = generate_option_chain(seed=42)
-        df2 = generate_option_chain(seed=123)
+        fixed = date(2026, 1, 1)
+        df1 = generate_option_chain(seed=42, trade_date=fixed)
+        df2 = generate_option_chain(seed=123, trade_date=fixed)
         # 少なくとも IV は異なるはず（ノイズが入っているので）
         assert not df1["implied_volatility"].equals(df2["implied_volatility"])
-
 
 # ──────────────────────────────────────────────────────────
 # 異常系
