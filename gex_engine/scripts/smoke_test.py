@@ -148,10 +148,21 @@ def run_smoke_test() -> bool:
         f"strike 範囲: {df['strike'].min():.0f} 〜 {df['strike'].max():.0f}"
     )
 
+    # Adapter が解釈した取引日 T を df から抽出 (obs.F 修正、誤判断25)
+    # 詳細は run_daily.py 同箇所のコメント参照。
+    assert "trade_date" in df.columns, (
+        "Adapter must emit trade_date column (誤判断25)"
+    )
+    assert df["trade_date"].nunique() == 1, (
+        "trade_date must be unique per get_option_chain call (誤判断25)"
+    )
+    trade_date = df["trade_date"].iloc[0].date()
+    info(f"Adapter resolved trade_date: {trade_date}")
+
     # ── ステップ 2: Core Logic で計算 ──
     section("ステップ 2: calculate_all → GEXResult")
-    step("calculate_all(df, today, data_source='mock') を呼ぶ")
-    result = calculate_all(df, as_of=date.today(), data_source=fetcher.source_name)
+    step(f"calculate_all(df, as_of={trade_date}, data_source='mock') を呼ぶ")
+    result = calculate_all(df, as_of=trade_date, data_source=fetcher.source_name)
 
     info(f"型: {type(result).__name__}")
     info(f"symbol: {result.symbol}")
