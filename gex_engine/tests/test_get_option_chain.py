@@ -334,3 +334,40 @@ def test_get_option_chain_zero_match_logs_and_returns_empty(
     ]
     assert len(zero_match_logs) == 1
     assert zero_match_logs[0].levelno == logging.WARNING
+
+
+# ── 誤判断25: trade_date 列の契約 ──
+
+@respx.mock
+def test_get_option_chain_emits_trade_date_column(
+    adapter: ThetaRestAdapter,
+) -> None:
+    """rest が出す trade_date 列は _resolve_trade_date の結果と一致する。
+
+    obs.F (run_daily.py の as_of=today バグ) の再発を構造的に防ぐ
+    レグレッションテスト。Adapter が「自分が解釈した取引日 T」を
+    必ず外部に公開する契約 (誤判断25, 2026-05-24)。
+
+    as_of=2026-05-14(木) → T=2026-05-13(水)。
+    全行で trade_date 列が pd.Timestamp("2026-05-13") を持つ。
+    """
+    # pandas は他のテストでは未使用のため関数ローカル import
+    import pandas as pd
+
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
+    )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    # trade_date 列が必須スキーマに含まれる
+    assert "trade_date" in df.columns
+    # 全行同じ値（1 つの get_option_chain 呼び出し = 1 取引日）
+    assert df["trade_date"].nunique() == 1
+    # 値は _resolve_trade_date の結果 (T = 5/13)
+    expected = pd.Timestamp("2026-05-13")
+    assert df["trade_date"].iloc[0] == expected

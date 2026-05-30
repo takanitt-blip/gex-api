@@ -41,6 +41,7 @@ AnomalyType = Literal[
 def generate_option_chain(
     symbol: str = "SPY",
     spot_price: float = 450.0,
+    trade_date: date | None = None,
     expiration: date | None = None,
     strike_step: float = 5.0,
     strike_range_pct: float = 0.20,
@@ -52,6 +53,8 @@ def generate_option_chain(
     Args:
         symbol: シンボル名
         spot_price: 現在のスポット価格
+        trade_date: Adapter が解釈した取引日 T。None なら今日。
+            schema.REQUIRED_DTYPES の trade_date 列に全行同じ値で入る。
         expiration: 満期日。None なら 30 日後の金曜日
         strike_step: ストライクの刻み幅（$）
         strike_range_pct: スポット価格の何 % まで広げるか（片側）
@@ -64,6 +67,8 @@ def generate_option_chain(
     """
     rng = np.random.default_rng(seed)
 
+    if trade_date is None:
+        trade_date = datetime.now().date()
     if expiration is None:
         expiration = _next_friday(days_ahead=30)
 
@@ -92,6 +97,9 @@ def generate_option_chain(
             rows.append(row)
 
     df = pd.DataFrame(rows)
+    # 取引日 T を全行に持たせる（誤判断25, 2026-05-24）
+    # schema.REQUIRED_DTYPES の trade_date 列。詳細は schema.py のメモ参照。
+    df["trade_date"] = pd.Timestamp(trade_date)
     return coerce_to_schema(df)
 
 
@@ -112,6 +120,7 @@ def generate_with_anomaly(
         異常を含む DataFrame（"empty" の場合は空 DF）
     """
     if anomaly_type == "empty":
+        # empty_dataframe() は schema 由来で trade_date 列を含む（γ-1）
         return empty_dataframe()
 
     df = generate_option_chain(**kwargs)
@@ -260,19 +269,22 @@ class MockDataFetcher:
     ) -> pd.DataFrame:
         """オプションチェーンを返す。
 
-        as_of は現状無視（Mock なので常に同じデータを返す）。
-        将来、過去日のシミュレーションが必要なら spot_price を
-        as_of 連動にする。今は不要。
+        as_of は trade_date 列としてデータに反映される（誤判断25, 2026-05-24）。
+        Mock では「前営業日」概念がないので as_of そのものを trade_date に
+        使う（rest と違って T 解決ロジックを持たない）。
+        スポット価格・OI/IV 分布は as_of に依存しない（再現性確保のため）。
         """
         if self.anomaly is not None:
             return generate_with_anomaly(
                 self.anomaly,
                 symbol=symbol,
                 spot_price=self.spot_price,
+                trade_date=as_of,
                 seed=self.seed,
             )
         return generate_option_chain(
             symbol=symbol,
             spot_price=self.spot_price,
+            trade_date=as_of,
             seed=self.seed,
         )

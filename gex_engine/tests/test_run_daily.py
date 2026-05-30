@@ -279,3 +279,93 @@ class TestOIDistributionLogging:
 
         # 例外を投げない（caplog に warning が出る）
         assert "Failed to log OI distribution" in caplog.text
+
+
+# ──────────────────────────────────────────────────────────
+# 誤判断25: trade_date が df 経由で calculate_all に渡る契約
+# ──────────────────────────────────────────────────────────
+
+class TestTradeDateFlow:
+    """obs.F (run_daily as_of=today バグ) の再発防止テスト。
+
+    run_daily は Adapter が出した trade_date 列から as_of を抽出して
+    calculate_all に渡す契約 (誤判断25, 2026-05-24)。
+    旧コードは date.today() を渡しており、土曜 cron で Adapter の
+    解決値 (前金曜) と食い違って非取引日キーが JSON に書き込まれた。
+    """
+
+    def test_calculate_all_receives_trade_date_from_df(
+        self, tmp_path, monkeypatch
+    ):
+        """calculate_all は df["trade_date"] の値を as_of として受け取る。
+
+        cron 起動日 (today) ではなく、Adapter が解釈した T が渡されることを
+        構造的に検証する。MockDataFetcher を差し替えて特定の trade_date を
+        持つ df を返し、calculate_all の呼び出し引数を捕まえる。
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GEX_DATA_SOURCE", "mock")
+
+        # Adapter が「金曜の T」を返したシミュレーション
+        # (cron の today が土曜でも Adapter は前金曜を解決する想定)
+        adapter_resolved_t = date(2026, 5, 22)  # 金曜
+
+        # 正常な df を Mock で作り、trade_date 列だけ差し替える
+        base_fetcher = MockDataFetcher(spot_price=450.0, seed=42)
+        sample_df = base_fetcher.get_option_chain("SPY", date.today())
+        sample_df["trade_date"] = pd.Timestamp(adapter_resolved_t)
+
+        # calculate_all の呼び出しを捕まえる
+        captured_kwargs = {}
+
+        def fake_calculate_all(df, **kwargs):
+            captured_kwargs.update(kwargs)
+            # 実物の calculate_all を呼んで成果物を返す
+            # (main の続きが破綻しないように)
+            from gex_engine.core.gex import calculate_all as real
+            return real(df, **kwargs)
+
+        with patch.object(
+            MockDataFetcher, "get_option_chain", return_value=sample_df
+        ):
+            with patch(
+                "gex_engine.scripts.run_daily.calculate_all",
+                side_effect=fake_calculate_all,
+            ):
+                result = main()
+
+        assert result == 0
+        # ★ 契約: as_of は cron の today ではなく Adapter の T
+        assert captured_kwargs.get("as_of") == adapter_resolved_t, (
+            f"as_of must come from df['trade_date'] "
+            f"(expected {adapter_resolved_t}, "
+            f"got {captured_kwargs.get('as_of')})"
+        )
+
+    def test_missing_trade_date_column_raises(
+        self, tmp_path, monkeypatch
+    ):
+        """Adapter が trade_date 列を忘れたら run_daily の assert で即死。
+
+        将来 SDK Adapter 等の新規実装が trade_date 列を出し忘れた場合、
+        run_daily 自身が拒否することを保証する構造的契約のテスト。
+        AssertionError は main の try/except に拾われて exit code 1。
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("GEX_DATA_SOURCE", "mock")
+
+        # trade_date 列を抜いた df (γ-1 以前の状態を模擬)
+        base_fetcher = MockDataFetcher(spot_price=450.0, seed=42)
+        sample_df = base_fetcher.get_option_chain("SPY", date.today())
+        broken_df = sample_df.drop(columns=["trade_date"])
+        assert "trade_date" not in broken_df.columns  # sanity check
+
+        with patch.object(
+            MockDataFetcher, "get_option_chain", return_value=broken_df
+        ):
+            result = main()
+
+        # AssertionError が main の try/except で捕まり exit code 1
+        assert result == 1
+        # JSON は書かれていない (assert は GEX 計算の前)
+        assert not (tmp_path / "gex_history.json").exists()

@@ -174,9 +174,33 @@ def run() -> None:
             )
             return
 
+        # ── Adapter が解釈した取引日 T を df から抽出（obs.F 修正、誤判断25）──
+        # 旧コード: as_of=today (cron 起動日の JST today) を Core に渡していた。
+        # これだと土曜 cron は土曜を Core に渡し、Adapter が解決した金曜の
+        # データと食い違って JSON に非取引日キーが書き込まれる事故 (obs.F) が
+        # 発生した。
+        #
+        # 新コード: schema.REQUIRED_DTYPES の trade_date 列 (γ-1, γ-2 で
+        # Adapter が必ず出すようになった) から T を抽出して Core に渡す。
+        # これで Adapter の T と Core の as_of が常に一致する。
+        #
+        # assert は「将来 Adapter が trade_date を忘れた / 複数 T を混在
+        # させた」事故を即座に検出するための契約。
+        assert "trade_date" in df.columns, (
+            "Adapter must emit trade_date column (誤判断25)"
+        )
+        assert df["trade_date"].nunique() == 1, (
+            "trade_date must be unique per get_option_chain call (誤判断25)"
+        )
+        trade_date = df["trade_date"].iloc[0].date()
+        logger.info(
+            "Adapter resolved trade_date: %s (vs cron today=%s)",
+            trade_date, today,
+        )
+
         # ── GEX 計算 ──
-        logger.info("Calculating GEX...")
-        result = calculate_all(df, as_of=today, data_source=fetcher.source_name)
+        logger.info("Calculating GEX (trade_date=%s from Adapter)...", trade_date)
+        result = calculate_all(df, as_of=trade_date, data_source=fetcher.source_name)
 
         # JSON 出力時のスケール変換と同じ計算をログでも行う
         # （obs.A 是正: ログと JSON の同名フィールドの単位差を解消）

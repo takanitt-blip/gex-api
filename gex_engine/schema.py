@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────
 
 # 必須カラム: 全 Adapter が必ず返すべき列
+#
+# 設計メモ (誤判断25, 2026-05-24):
+#   trade_date は「Adapter が解釈した取引日 T」を意味する。
+#   run_daily.py の as_of=today バグ (obs.F) の根本原因は、
+#   「Adapter は内部で T を解決するが、その T を外に出していなかった」
+#   ことだった。結果、消費者側 (Core) が独自に as_of を決め打ちし、
+#   Adapter の T と食い違って週末/休場日に非取引日のまま JSON に
+#   書き込む事故が発生した。
+#
+#   trade_date を必須列にすることで、全 Adapter は「自分が解釈した
+#   取引日」を必ず明示する契約になる。validate() が存在を保証し、
+#   新規 Adapter (SDK 等) が忘れる事故を構造的に防ぐ。
+#
+#   全行同じ値が入る (1 つの get_option_chain 呼び出し = 1 取引日)。
+#   消費者側は df["trade_date"].iloc[0].date() で取得する。
 REQUIRED_DTYPES: dict[str, str] = {
     "symbol": "string",              # 例: "SPY"
     "expiration": "datetime64[ns]",  # pd.Timestamp（v10 論点1で決定）
@@ -37,6 +52,7 @@ REQUIRED_DTYPES: dict[str, str] = {
     "implied_volatility": "float64", # decimal スケール（v10 論点2: 0.15 = 15%）
     "open_interest": "Int64",        # 建玉（pandas nullable int）
     "underlying_price": "float64",   # スポット価格
+    "trade_date": "datetime64[ns]",  # Adapter が解釈した取引日 T（誤判断25, 2026-05-24）
 }
 
 # 推奨カラム: あれば望ましい列。Adapter が出せれば出す

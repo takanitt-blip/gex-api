@@ -284,6 +284,14 @@ class ThetaRestAdapter:
                 status_code=200,
             )
 
+        # ── 取引日 T を全行に持たせる（誤判断25, 2026-05-24）──
+        # obs.F の真因: Adapter が解釈した T が外に出ず、消費者側 (Core) が
+        # 独自に as_of=today を決め打ちして食い違う事故が発生した。
+        # schema.REQUIRED_DTYPES の trade_date 列にこの T を載せて、
+        # run_daily / smoke_test 側が df["trade_date"] から拾えるようにする。
+        # 全行同じ値（1 つの get_option_chain 呼び出し = 1 取引日）。
+        merged["trade_date"] = pd.Timestamp(trade_date)
+
         # ── 統一スキーマに整形 ──
         return coerce_to_schema(merged[list(REQUIRED_DTYPES.keys())])
 

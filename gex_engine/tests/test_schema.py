@@ -35,6 +35,9 @@ def make_valid_df(n_rows: int = 3) -> pd.DataFrame:
         "implied_volatility": [0.15, 0.18, 0.20][:n_rows],
         "open_interest": [1000, 500, 300][:n_rows],
         "underlying_price": [450.0] * n_rows,
+        # trade_date: Adapter が解釈した取引日 T（誤判断25, γ-1 で REQUIRED 化）。
+        # 取引日 < 満期日 の自然な関係（2026-05-14 取引、2026-06-19 満期）。
+        "trade_date": pd.to_datetime(["2026-05-14"] * n_rows),
     }
     df = pd.DataFrame(base)
     return coerce_to_schema(df)
@@ -211,6 +214,7 @@ class TestCoerce:
             "implied_volatility": [0.15],
             "open_interest": [1000],
             "underlying_price": [450.0],
+            "trade_date": ["2026-05-14"],   # 文字列（coerce で datetime64 に変換される）
         })
         coerced = coerce_to_schema(df)
         for col, dtype in REQUIRED_DTYPES.items():
