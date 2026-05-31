@@ -6,6 +6,13 @@ REST Adapter（respx で httpx をモック）で同じ一気通貫を確認す�
 実 ThetaData API は契約していないため、respx で公式仕様通りの
 レスポンスを返すモックを立てて、Adapter 以降の挙動を検証する。
 
+history 移行（DESIGN_history_rest_adapter.md）に伴い、モックすべき
+エンドポイントは以下の 3 つ（snapshot 時代の 2 つから変わった、obs.H）:
+    1. /v3/calendar/on_date            … _resolve_trade_date が取引日 T を解決
+    2. /v3/option/history/open_interest … OI（date=T）
+    3. /v3/option/history/greeks/eod    … IV/bid/ask/spot（start=end=T）
+       ★ greeks/implied_volatility ではない（rest.py の警告参照）。
+
 実行:
     cd /home/claude && python -m gex_engine.scripts.smoke_test_rest
 """
@@ -14,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import tempfile
 from datetime import date, datetime, timezone
@@ -61,36 +67,60 @@ def info(msg: str) -> None:
     print(f"    {msg}")
 
 
+# calendar/on_date が全営業日「open」を返すモック本文。
+# rest.py の実機ダンプ仕様: ヘッダ + 1 データ行（値はダブルクオート囲み）。
+#   type,open,close
+#   "open","09:30:00","16:00:00"
+# どの date パラメータでも常に open を返すので、_resolve_trade_date は
+# as_of の前日（直近過去営業日）を即 T として確定する。
+_CALENDAR_OPEN_CSV = 'type,open,close\n"open","09:30:00","16:00:00"\n'
+
+
 @respx.mock
 def run_smoke_test() -> bool:
     """REST Adapter（モック化）→ Core → I/O の一気通貫を検証。"""
-    section("end-to-end スモークテスト（段階4: REST Adapter）")
+    section("end-to-end スモークテスト（段階4: REST Adapter / history）")
 
-    OI_URL = "http://127.0.0.1:25503/v3/option/snapshot/open_interest"
-    IV_URL = "http://127.0.0.1:25503/v3/option/snapshot/greeks/implied_volatility"
+    BASE = "http://127.0.0.1:25503/v3"
+    CAL_URL = f"{BASE}/calendar/on_date"
+    OI_URL = f"{BASE}/option/history/open_interest"
+    GREEKS_URL = f"{BASE}/option/history/greeks/eod"
 
     oi_csv = (FIXTURES / "oi_normal.csv").read_text(encoding="utf-8")
-    iv_csv = (FIXTURES / "iv_normal.csv").read_text(encoding="utf-8")
+    greeks_csv = (FIXTURES / "greeks_eod_normal.csv").read_text(encoding="utf-8")
 
+    # calendar は date パラメータに依らず常に open（respx は query を無視して
+    # path で一致させるため、ヘルパー1 つで全候補日をカバーできる）。
+    respx.get(CAL_URL).mock(return_value=httpx.Response(200, text=_CALENDAR_OPEN_CSV))
     respx.get(OI_URL).mock(return_value=httpx.Response(200, text=oi_csv))
-    respx.get(IV_URL).mock(return_value=httpx.Response(200, text=iv_csv))
+    respx.get(GREEKS_URL).mock(return_value=httpx.Response(200, text=greeks_csv))
 
     # ── ステップ 1: REST Adapter からデータ取得 ──
     section("ステップ 1: REST Adapter → DataFrame")
     step("ThetaRestAdapter（respx でモック）を生成")
 
+    # as_of=5/13 → _resolve_trade_date が前日 5/12 を取引日 T として確定。
+    # フィクスチャの underlying_timestamp が 2026-05-12 EOD なので、
+    # T=5/12 で計算すれば DTE がフィクスチャの実態と整合する。
+    as_of = date(2026, 5, 13)
     with ThetaRestAdapter(max_retries=0, retry_backoff_base=0.0) as fetcher:
-        step("get_option_chain('SPY', today)")
-        df = fetcher.get_option_chain("SPY", date(2026, 5, 9))
+        step(f"get_option_chain('SPY', {as_of})")
+        df = fetcher.get_option_chain("SPY", as_of)
 
     info(f"DataFrame shape: {df.shape}")
     info(f"列: {list(df.columns)}")
     info(f"underlying_price (unique): {df['underlying_price'].unique().tolist()}")
     info(f"strike 範囲: {df['strike'].min():.2f} 〜 {df['strike'].max():.2f}")
 
+    # ── a7-A 契約（誤判断25）: 取引日 T は df の列から拾う ──
+    # as_of(=today 相当) を直接 calculate_all に渡すと obs.F の as_of 1 日
+    # ズレを再生産する。schema.py の契約どおり df["trade_date"] を使う。
+    trade_date = df["trade_date"].iloc[0].date()
+    info(f"trade_date (df 由来, a7-A): {trade_date}")
+
     # ── ステップ 2: Core Logic で計算 ──
     section("ステップ 2: calculate_all → GEXResult")
-    result = calculate_all(df, as_of=date(2026, 5, 9), data_source=fetcher.source_name)
+    result = calculate_all(df, as_of=trade_date, data_source=fetcher.source_name)
 
     info(f"symbol: {result.symbol}")
     info(f"underlying_price: {result.underlying_price}")
@@ -105,7 +135,7 @@ def run_smoke_test() -> bool:
     section("ステップ 3: save_gex_result → JSON")
     tmpdir = tempfile.mkdtemp()
     json_path = os.path.join(tmpdir, "gex_history.json")
-    fixed_utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
+    fixed_utc = datetime(2026, 5, 13, 22, 30, 0, tzinfo=timezone.utc)
     save_gex_result(result, path=json_path, now_utc=fixed_utc)
 
     with open(json_path, encoding="utf-8") as f:
@@ -122,9 +152,9 @@ def run_smoke_test() -> bool:
         nonlocal fail_count, pass_count
         try:
             ok = predicate()
-        except Exception as e:
+        except Exception as ex:
             ok = False
-            detail = f"{detail} (例外: {type(e).__name__}: {e})"
+            detail = f"{detail} (例外: {type(ex).__name__}: {ex})"
         if ok:
             passed(f"{label} {detail}".rstrip())
             pass_count += 1
@@ -134,14 +164,20 @@ def run_smoke_test() -> bool:
 
     e = history[next(iter(history.keys()))]
 
+    # フィクスチャ greeks_eod_normal.csv の underlying_price は 738.18
+    # （history 時代の SPY 現実データ。snapshot/Mock 時代の 450.25 ではない）。
+    FIXTURE_SPOT = 738.18
+    # フィクスチャに存在する strike の範囲（max_pain はこの中の 1 つ）。
+    STRIKE_MIN, STRIKE_MAX = 335.0, 990.0
+
     check(
         "data_source == 'rest'",
         lambda: e["data_source"] == "rest",
         f"(実測: {e['data_source']!r})",
     )
     check(
-        "underlying_price がフィクスチャ値 450.25 と一致",
-        lambda: e["underlying_price"] == 450.25,
+        f"underlying_price がフィクスチャ値 {FIXTURE_SPOT} と一致",
+        lambda: e["underlying_price"] == FIXTURE_SPOT,
         f"(実測: {e['underlying_price']})",
     )
     check(
@@ -159,8 +195,8 @@ def run_smoke_test() -> bool:
         f"(spot={e['underlying_price']}, PW={e['put_wall']})",
     )
     check(
-        "max_pain がフィクスチャ範囲 [440, 460] 内",
-        lambda: 440 <= e["max_pain"] <= 460,
+        f"max_pain がフィクスチャ strike 範囲 [{STRIKE_MIN}, {STRIKE_MAX}] 内",
+        lambda: STRIKE_MIN <= e["max_pain"] <= STRIKE_MAX,
         f"(MP={e['max_pain']})",
     )
     check(
