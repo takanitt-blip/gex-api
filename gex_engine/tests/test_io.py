@@ -15,7 +15,7 @@ import math
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Optional
 
@@ -84,46 +84,18 @@ class TestScaleTotalGex(unittest.TestCase):
 # make_date_key（タイムゾーン処理）
 # ============================================================
 class TestMakeDateKey(unittest.TestCase):
-    def test_et_basis_during_eastern_daylight(self):
-        # 2026-05-09 22:30 UTC = 2026-05-09 18:30 ET (EDT, UTC-4)
-        # → ET 基準で "2026.05.09"
-        utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
-        self.assertEqual(make_date_key(utc), "2026.05.09")
+    def test_formats_date_with_dots(self):
+        self.assertEqual(make_date_key(date(2026, 5, 20)), "2026.05.20")
 
-    def test_et_basis_during_eastern_standard(self):
-        # 2026-01-09 22:30 UTC = 2026-01-09 17:30 ET (EST, UTC-5)
-        # → ET 基準で "2026.01.09"
-        utc = datetime(2026, 1, 9, 22, 30, 0, tzinfo=timezone.utc)
-        self.assertEqual(make_date_key(utc), "2026.01.09")
-
-    def test_jst_morning_still_et_yesterday(self):
-        # JST 翌日 07:30 = UTC 22:30 = ET 同日 17:30/18:30
-        # → 日付は ET 基準で前日のまま（v11 の cron 想定通り）
-        utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
-        # JST: 2026-05-10 07:30 だが、ET 基準で "2026.05.09"
-        self.assertEqual(make_date_key(utc), "2026.05.09")
-
-    def test_naive_datetime_treated_as_utc(self):
-        naive = datetime(2026, 5, 9, 22, 30, 0)  # tzinfo なし
-        self.assertEqual(make_date_key(naive), "2026.05.09")
+    def test_no_timezone_conversion(self):
+        # session_date は既に取引日。TZ 変換しない（now() 依存を排除済み, obs.G）。
+        self.assertEqual(make_date_key(date(2026, 1, 9)), "2026.01.09")
 
     def test_dot_separator_format(self):
-        # EA 互換のため、ドット区切りでなければならない
-        utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
-        key = make_date_key(utc)
+        key = make_date_key(date(2026, 5, 9))
         self.assertEqual(len(key), 10)
         self.assertEqual(key[4], ".")
         self.assertEqual(key[7], ".")
-
-    def test_midnight_et_boundary(self):
-        # ET 0:00 ちょうど（前日 5/9 の cron 後の境界）
-        # 2026-05-10 04:00 UTC = 2026-05-10 00:00 ET (EDT)
-        utc = datetime(2026, 5, 10, 4, 0, 0, tzinfo=timezone.utc)
-        self.assertEqual(make_date_key(utc), "2026.05.10")
-
-        # その 1 分前（ET 23:59 = UTC 03:59）はまだ前日
-        utc = datetime(2026, 5, 10, 3, 59, 0, tzinfo=timezone.utc)
-        self.assertEqual(make_date_key(utc), "2026.05.09")
 
 
 # ============================================================
@@ -572,7 +544,8 @@ class TestSaveGexResultIntegration(unittest.TestCase):
         utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
 
         entry = save_gex_result(
-            result, path=self.path, data_source="mock", now_utc=utc
+            result, path=self.path, session_date=date(2026, 5, 9),
+            data_source="mock", now_utc=utc
         )
 
         self.assertTrue(os.path.exists(self.path))
@@ -589,14 +562,14 @@ class TestSaveGexResultIntegration(unittest.TestCase):
         utc1 = datetime(2026, 5, 8, 22, 30, 0, tzinfo=timezone.utc)
         save_gex_result(
             self._make_result(call_wall=460.0),
-            path=self.path, now_utc=utc1,
+            path=self.path, session_date=date(2026, 5, 8), now_utc=utc1,
         )
 
         # 2日目
         utc2 = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
         save_gex_result(
             self._make_result(call_wall=465.0),
-            path=self.path, now_utc=utc2,
+            path=self.path, session_date=date(2026, 5, 9), now_utc=utc2,
         )
 
         with open(self.path, encoding="utf-8") as f:
@@ -610,9 +583,9 @@ class TestSaveGexResultIntegration(unittest.TestCase):
         utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
 
         save_gex_result(self._make_result(call_wall=465.0),
-                        path=self.path, now_utc=utc)
+                        path=self.path, session_date=date(2026, 5, 9), now_utc=utc)
         save_gex_result(self._make_result(call_wall=470.0),
-                        path=self.path, now_utc=utc)
+                        path=self.path, session_date=date(2026, 5, 9), now_utc=utc)
 
         with open(self.path, encoding="utf-8") as f:
             history = json.load(f)
@@ -628,7 +601,7 @@ class TestSaveGexResultIntegration(unittest.TestCase):
             f.write("{garbage not json")
 
         utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
-        save_gex_result(self._make_result(), path=self.path, now_utc=utc)
+        save_gex_result(self._make_result(), path=self.path, session_date=date(2026, 5, 9), now_utc=utc)
 
         with open(self.path, encoding="utf-8") as f:
             history = json.load(f)
@@ -641,6 +614,7 @@ class TestSaveGexResultIntegration(unittest.TestCase):
             save_gex_result(
                 self._make_result(),
                 path=self.path,
+                session_date=date(2026, 5, day),
                 now_utc=utc,
                 max_entries=3,
             )
@@ -663,7 +637,7 @@ class TestSaveGexResultIntegration(unittest.TestCase):
           - call_wall, put_wall, zero_gamma が数値で読める
         """
         utc = datetime(2026, 5, 9, 22, 30, 0, tzinfo=timezone.utc)
-        save_gex_result(self._make_result(), path=self.path, now_utc=utc)
+        save_gex_result(self._make_result(), path=self.path, session_date=date(2026, 5, 9), now_utc=utc)
 
         with open(self.path, encoding="utf-8") as f:
             content = f.read()

@@ -30,6 +30,7 @@ from ..adapters.base import DataFetcher
 from ..adapters.mock import MockDataFetcher
 from ..adapters.rest import ThetaRestAdapter
 from ..core.gex import calculate_all
+from ..market_calendar import next_business_day
 from ..io_layer import save_gex_result
 from ..io_layer.serializer import scale_total_gex
 
@@ -198,6 +199,15 @@ def run() -> None:
             trade_date, today,
         )
 
+        # このエントリが支配する取引セッション = next_business_day(trade_date)。
+        # obs.G 根治: JSON キーを now()(cron 発火日) ではなく trade_date から
+        # 決定論的に決める。fetcher.schedule_type_on を calendar lookup に注入。
+        session_date = next_business_day(trade_date, fetcher.schedule_type_on)
+        logger.info(
+            "session_date (JSON key) = next_business_day(%s) = %s",
+            trade_date, session_date,
+        )
+
         # ── GEX 計算 ──
         logger.info("Calculating GEX (trade_date=%s from Adapter)...", trade_date)
         result = calculate_all(df, as_of=trade_date, data_source=fetcher.source_name)
@@ -224,7 +234,7 @@ def run() -> None:
 
         # ── JSON 追記 ──
         logger.info("Saving to %s...", OUTPUT_PATH)
-        entry = save_gex_result(result, path=OUTPUT_PATH)
+        entry = save_gex_result(result, path=OUTPUT_PATH, session_date=session_date)
         logger.info("Saved entry: %s", entry)
 
         # ── 診断ログ（段階 6C 検証用、rest のときのみ）──

@@ -13,7 +13,7 @@ GEXResult → JSON 出力用 dict への変換
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 
@@ -53,30 +53,15 @@ def scale_total_gex(raw_total_gex: float, spot: float) -> float:
 # ============================================================
 # 日付・時刻
 # ============================================================
-def make_date_key(now_utc: Optional[datetime] = None) -> str:
+def make_date_key(session_date: date) -> str:
+    """EA が読む日付キーを生成（"YYYY.MM.DD" 形式）。
+
+    obs.G 根治: キーは「このEOD地図が支配する取引セッション
+    = next_business_day(trade_date)」を表す。呼び出し側が
+    market_calendar.next_business_day で算出して渡す。now() には依存しない。
+    session_date は既にカレンダー由来の取引日なので TZ 変換は不要。
     """
-    EA が読む日付キーを生成（"YYYY.MM.DD" 形式、ET 基準）。
-
-    なぜ ET 基準か:
-      - ThetaData の OI 報告は ET 06:30 の「前営業日 EOD」値
-      - cron は UTC 22:30 = ET 17:30/18:30 に走る（v11 セクション6）
-      - データの「業務日」と一致させるため
-
-    Args:
-        now_utc: 現在時刻（UTC）。テスト時に注入可能。
-                 None なら datetime.now(timezone.utc)。
-
-    Returns:
-        "2026.05.09" 形式の文字列（ドット区切り、EA 互換）
-    """
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    elif now_utc.tzinfo is None:
-        # naive datetime は UTC とみなす
-        now_utc = now_utc.replace(tzinfo=timezone.utc)
-
-    now_et = now_utc.astimezone(ET_TZ)
-    return now_et.strftime("%Y.%m.%d")
+    return session_date.strftime("%Y.%m.%d")
 
 
 def make_timestamp(now_utc: Optional[datetime] = None) -> str:
