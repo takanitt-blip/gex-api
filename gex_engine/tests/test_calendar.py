@@ -299,3 +299,35 @@ def test_resolve_trade_date_lookback_boundary(
 # 「日付の非対称性」（test_resolve_and_next_are_asymmetric の
 # 検証対象）は誤読由来の概念だったため、テストごと削除する
 # のが正しい（PC_GOVERNANCE 4.1 / 誤判断15 系統）。
+
+# ── 公開ラッパ schedule_type_on（obs.G: Protocol 経由のカレンダー lookup）──
+
+class TestScheduleTypeOn:
+    """schedule_type_on は _fetch_calendar_on_date をそのまま公開するラッパ。"""
+
+    @respx.mock
+    def test_returns_open(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_OPEN))
+        assert adapter.schedule_type_on(date(2026, 5, 15)) == "open"
+
+    @respx.mock
+    def test_returns_early_close(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_EARLY_CLOSE))
+        assert adapter.schedule_type_on(date(2025, 11, 28)) == "early_close"
+
+    @respx.mock
+    def test_returns_full_close(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_FULL_CLOSE))
+        assert adapter.schedule_type_on(date(2025, 12, 25)) == "full_close"
+
+    @respx.mock
+    def test_returns_weekend(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_WEEKEND))
+        assert adapter.schedule_type_on(date(2026, 5, 16)) == "weekend"
+
+    @respx.mock
+    def test_delegates_with_yyyymmdd(self, adapter: ThetaRestAdapter) -> None:
+        route = respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_OPEN))
+        adapter.schedule_type_on(date(2026, 5, 15))
+        assert route.called
+        assert route.calls.last.request.url.params["date"] == "20260515"

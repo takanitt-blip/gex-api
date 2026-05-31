@@ -8,16 +8,12 @@ JSON I/O 層 - GEXResult を JSON ファイルに書き出すための機能群�
   - history.py    : 履歴のロード・マージ
   - writer.py     : atomic write
   - facade        : save_gex_result() で 3 段を一気通貫
-
-各モジュールはテスト容易性のため独立しており、それぞれ単独で
-ユニットテスト可能。
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 from .history import load_history, merge_entry, trim_history
@@ -49,42 +45,36 @@ def save_gex_result(
     result: Any,
     *,
     path: str,
+    session_date: date,
     data_source: Optional[str] = None,
     now_utc: Optional[datetime] = None,
     max_entries: Optional[int] = None,
 ) -> dict:
-    """
-    GEXResult を JSON 履歴ファイルに保存する Facade 関数。
-
-    内部処理:
-      1. serialize_result() で dict に変換（スケール変換、丸め含む）
-      2. load_history() で既存履歴を読み込み
-      3. merge_entry() で当日エントリをマージ（差分があれば警告ログ）
-      4. trim_history() で必要なら履歴を切り詰め
-      5. write_json_atomic() でアトミック書き込み
+    """GEXResult を JSON 履歴ファイルに保存する Facade 関数。
 
     Args:
         result: GEXResult インスタンス（または同等の dict）
         path: 履歴 JSON のパス（例: "gex_history.json"）
+        session_date: このエントリが支配する取引セッションの日付（ET 取引日）。
+            JSON の日付キーになる。呼び出し側が
+            market_calendar.next_business_day(trade_date, fetcher.schedule_type_on)
+            で算出して渡す（obs.G 根治: キーを now()/today() から切り離す）。
         data_source: 上書き用。None なら GEXResult.data_source を使用。
-        now_utc: 現在時刻（テスト用に注入可能）
+        now_utc: 現在時刻（テスト用に注入可能）。**timestamp フィールド専用**で、
+            日付キーには使わない（obs.G: 鍵を now() 依存から外したため）。
         max_entries: 履歴の最大エントリ数（None なら無制限）
 
     Returns:
-        書き込まれた当日エントリ（呼び出し側でログ出力等に使える）
+        書き込まれた当日エントリ。
     """
-    # 1. シリアライズ
-    entry = serialize_result(
-        result,
-        data_source=data_source,
-        now_utc=now_utc,
-    )
+    # 1. シリアライズ（timestamp は now_utc 由来＝書き込み時刻で正当）
+    entry = serialize_result(result, data_source=data_source, now_utc=now_utc)
 
     # 2. 既存履歴を読み込み
     history = load_history(path)
 
-    # 3. 当日エントリをマージ
-    date_key = make_date_key(now_utc)
+    # 3. エントリをマージ。キーは now() ではなく session_date（obs.G 根治）。
+    date_key = make_date_key(session_date)
     history, warning = merge_entry(history, date_key, entry)
 
     if warning:

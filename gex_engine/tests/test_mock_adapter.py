@@ -212,3 +212,20 @@ class TestGEXReadiness:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+class TestScheduleTypeOn:
+    """mock の schedule_type_on は平日 open / 土日 weekend の素朴版（CI 用）。"""
+
+    def test_weekday_is_open(self):
+        assert MockDataFetcher().schedule_type_on(date(2026, 5, 25)) == "open"  # 月
+
+    def test_saturday_is_weekend(self):
+        assert MockDataFetcher().schedule_type_on(date(2026, 5, 23)) == "weekend"  # 土
+
+    def test_sunday_is_weekend(self):
+        assert MockDataFetcher().schedule_type_on(date(2026, 5, 24)) == "weekend"  # 日
+
+    def test_all_weekdays_open(self):
+        fetcher = MockDataFetcher()
+        for day in range(18, 23):  # 5/18(月)〜5/22(金)
+            assert fetcher.schedule_type_on(date(2026, 5, day)) == "open"

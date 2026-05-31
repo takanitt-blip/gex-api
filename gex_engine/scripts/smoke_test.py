@@ -41,6 +41,7 @@ from typing import Any, Callable
 from gex_engine.adapters.mock import MockDataFetcher
 from gex_engine.core.gex import calculate_all
 from gex_engine.io_layer import save_gex_result
+from gex_engine.market_calendar import next_business_day
 
 
 # ──────────────────────────────────────────────────────────
@@ -158,6 +159,8 @@ def run_smoke_test() -> bool:
     )
     trade_date = df["trade_date"].iloc[0].date()
     info(f"Adapter resolved trade_date: {trade_date}")
+    session_date = next_business_day(trade_date, fetcher.schedule_type_on)
+    info(f"session_date (JSON key): {session_date}")
 
     # ── ステップ 2: Core Logic で計算 ──
     section("ステップ 2: calculate_all → GEXResult")
@@ -186,7 +189,8 @@ def run_smoke_test() -> bool:
     entry = save_gex_result(
         result,
         path=json_path,
-        now_utc=fixed_utc,  # テストの再現性のため固定
+        session_date=session_date,
+        now_utc=fixed_utc,  # timestamp 用（再現性のため固定）
     )
 
     info(f"返り値の型: {type(entry).__name__}")
@@ -224,9 +228,9 @@ def run_smoke_test() -> bool:
     )
 
     runner.check(
-        "日付キーが ET 基準で '2026.05.09'",
-        lambda: date_key == "2026.05.09",
-        detail=f"(実測: {date_key!r})",
+        "日付キーが session_date と一致",
+        lambda: date_key == session_date.strftime("%Y.%m.%d"),
+        detail=f"(実測: {date_key!r}, 期待: {session_date.strftime('%Y.%m.%d')!r})",
     )
 
     e = history[date_key]

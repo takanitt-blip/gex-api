@@ -32,6 +32,7 @@ import respx
 from gex_engine.adapters.rest import ThetaRestAdapter
 from gex_engine.core.gex import calculate_all
 from gex_engine.io_layer import save_gex_result
+from gex_engine.market_calendar import next_business_day
 
 FIXTURES = Path(__file__).parent.parent / "tests" / "fixtures"
 
@@ -106,17 +107,17 @@ def run_smoke_test() -> bool:
     with ThetaRestAdapter(max_retries=0, retry_backoff_base=0.0) as fetcher:
         step(f"get_option_chain('SPY', {as_of})")
         df = fetcher.get_option_chain("SPY", as_of)
+        # a7-A: 取引日 T は df 由来。session_date は fetcher が開いている間に算出。
+        trade_date = df["trade_date"].iloc[0].date()
+        session_date = next_business_day(trade_date, fetcher.schedule_type_on)
 
     info(f"DataFrame shape: {df.shape}")
     info(f"列: {list(df.columns)}")
     info(f"underlying_price (unique): {df['underlying_price'].unique().tolist()}")
     info(f"strike 範囲: {df['strike'].min():.2f} 〜 {df['strike'].max():.2f}")
 
-    # ── a7-A 契約（誤判断25）: 取引日 T は df の列から拾う ──
-    # as_of(=today 相当) を直接 calculate_all に渡すと obs.F の as_of 1 日
-    # ズレを再生産する。schema.py の契約どおり df["trade_date"] を使う。
-    trade_date = df["trade_date"].iloc[0].date()
     info(f"trade_date (df 由来, a7-A): {trade_date}")
+    info(f"session_date (JSON key): {session_date}")
 
     # ── ステップ 2: Core Logic で計算 ──
     section("ステップ 2: calculate_all → GEXResult")
@@ -136,7 +137,7 @@ def run_smoke_test() -> bool:
     tmpdir = tempfile.mkdtemp()
     json_path = os.path.join(tmpdir, "gex_history.json")
     fixed_utc = datetime(2026, 5, 13, 22, 30, 0, tzinfo=timezone.utc)
-    save_gex_result(result, path=json_path, now_utc=fixed_utc)
+    save_gex_result(result, path=json_path, session_date=session_date, now_utc=fixed_utc)
 
     with open(json_path, encoding="utf-8") as f:
         history = json.load(f)
