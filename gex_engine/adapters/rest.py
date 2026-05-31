@@ -490,6 +490,15 @@ class ThetaRestAdapter:
 
         return type_value
 
+    def schedule_type_on(self, target: date) -> str:
+        """DataFetcher Protocol: 指定日の市場スケジュール type を返す。
+
+        検証済み低レベル関数 _fetch_calendar_on_date をそのまま公開する
+        ラッパ。OI/IV 取得ロジックには触れない（誤判断22/23/24 領域の不可侵）。
+        market_calendar.next_business_day の schedule_lookup として注入される。
+        """
+        return self._fetch_calendar_on_date(target)
+
     # 営業日とみなす type。early_close（短縮営業日）も取引日であり、
     # EOD レポートは生成されるため取引日に含める（DESIGN 3.3 step4）。
     _TRADING_DAY_TYPES: frozenset[str] = frozenset({"open", "early_close"})

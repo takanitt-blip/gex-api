@@ -288,3 +288,13 @@ class MockDataFetcher:
             trade_date=as_of,
             seed=self.seed,
         )
+
+
+    def schedule_type_on(self, target: date) -> str:
+        """DataFetcher Protocol: 指定日の市場スケジュール type（素朴版）。
+
+        Mock は実カレンダーを持たないため、平日 -> "open" / 土日 -> "weekend"。
+        market_calendar.next_business_day の schedule_lookup として注入される。
+        """
+        # weekday(): Mon=0 .. Fri=4, Sat=5, Sun=6
+        return "weekend" if target.weekday() >= 5 else "open"

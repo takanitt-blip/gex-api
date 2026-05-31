@@ -61,3 +61,18 @@ class DataFetcher(Protocol):
             Adapter 内で握り潰さず呼び出し側に伝播させること。
         """
         ...
+
+    def schedule_type_on(self, target: date) -> str:
+        """指定日の市場スケジュール type を返す。
+
+        obs.G 根治（gex_history.json の日付キーを
+        next_business_day(trade_date) に決定論化）のために、
+        market_calendar.next_business_day へ注入する calendar lookup。
+
+        Returns:
+            "open" / "early_close" / "full_close" / "weekend" のいずれか。
+        実装:
+            rest -> calendar/on_date を叩く実カレンダー。
+            mock -> 平日 open / 土日 weekend の素朴版（祝日は判定しない、CI 用）。
+        """
+        ...
