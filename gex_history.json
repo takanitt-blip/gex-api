@@ -295,5 +295,20 @@
     "symbol": "SPY",
     "as_of": "2026-06-02T00:00:00",
     "n_contracts_used": 16628762
+  },
+  "2026.06.04": {
+    "call_wall": 760.0,
+    "put_wall": 740.0,
+    "zero_gamma": 755.81,
+    "max_pain": 730.0,
+    "underlying_price": 754.24,
+    "total_gex": -1889759595,
+    "regime": "trend",
+    "regime_text": "トレンド相場・高ボラティリティ",
+    "timestamp": "2026-06-04T22:57:53Z",
+    "data_source": "rest",
+    "symbol": "SPY",
+    "as_of": "2026-06-03T00:00:00",
+    "n_contracts_used": 17472043
   }
 }
