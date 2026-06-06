@@ -13,6 +13,13 @@ history 移行（DESIGN_history_rest_adapter.md）に伴い、モックすべき
     3. /v3/option/history/greeks/eod    … IV/bid/ask/spot（start=end=T）
        ★ greeks/implied_volatility ではない（rest.py の警告参照）。
 
+v17（data_quality）注記:
+    このフィクスチャ（greeks_eod_normal.csv）は 8 strike の薄い切り出しで、
+    Brent が net gamma の符号反転を見つけられず zero_gamma=None になる
+    （obs.H で確認済み）。v17 の data_quality 判定（論点 c-1）では
+    「zero_gamma 解なし → data_error」なので、この smoke は data_error 経路を
+    end-to-end で通す確認になる（regime アサーションは v17 で廃止）。
+
 実行:
     cd /home/claude && python -m gex_engine.scripts.smoke_test_rest
 """
@@ -131,6 +138,8 @@ def run_smoke_test() -> bool:
     info(f"max_pain: {result.max_pain}")
     info(f"total_gex (素): {result.total_gex:.2f}")
     info(f"data_source: {result.data_source}")
+    info(f"data_quality: {result.data_quality}")
+    info(f"anomaly_detail: {result.anomaly_detail}")
 
     # ── ステップ 3: I/O 層で JSON 書き出し ──
     section("ステップ 3: save_gex_result → JSON")
@@ -204,10 +213,26 @@ def run_smoke_test() -> bool:
         "total_gex が int 型",
         lambda: isinstance(e["total_gex"], int) and not isinstance(e["total_gex"], bool),
     )
+
+    # v17 data_quality（regime ∈ {range,trend} の置き換え）:
+    # このフィクスチャは薄い切り出しで Brent が符号反転を見つけられず
+    # zero_gamma=None（obs.H 既知）。論点 c-1 により data_quality="data_error" が
+    # 正しい出力。data_quality / anomaly_detail が REST 経路で end-to-end に
+    # 流れることをここで確認する。
     check(
-        "regime ∈ {'range', 'trend'}",
-        lambda: e["regime"] in {"range", "trend"},
-        f"(実測: {e['regime']!r})",
+        "zero_gamma is null（薄いフィクスチャで Brent 解なし）",
+        lambda: e["zero_gamma"] is None,
+        f"(実測: {e['zero_gamma']!r})",
+    )
+    check(
+        "data_quality == 'data_error'（zero_gamma 解なし → c-1）",
+        lambda: e["data_quality"] == "data_error",
+        f"(実測: {e['data_quality']!r})",
+    )
+    check(
+        "anomaly_detail に zero_gamma の記載がある",
+        lambda: "zero_gamma" in (e.get("anomaly_detail") or ""),
+        f"(実測: {e.get('anomaly_detail')!r})",
     )
 
     # 後片付け

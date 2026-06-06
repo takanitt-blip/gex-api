@@ -2,8 +2,8 @@
 
 含まれる関数:
     - calculate_gex_per_strike()  : ストライク別の Net GEX
-    - find_call_wall()             : Call Wall 検出
-    - find_put_wall()              : Put Wall 検出
+    - find_call_wall()             : Call Wall 検出（公開・float 返し、フォールバック spot）
+    - find_put_wall()              : Put Wall 検出（公開・float 返し、フォールバック spot）
     - find_zero_gamma()            : Brent 法で Zero Gamma
     - find_max_pain()              : Max Pain
     - calculate_all()              : 上記を全部まとめて GEXResult を返す
@@ -11,8 +11,15 @@
 数式（議論で確定）:
     GEX_per_option = γ × OI × contract_size × sign
     sign = +1 (call), -1 (put)   ← ディーラー視点
-    
+
     × S や × S² は呼び出し側の表示時に追加（内部は素の単位）
+
+v17 変更（data_quality 導入）:
+    - 内部ヘルパー _find_call_wall_opt / _find_put_wall_opt を追加。
+      Wall が見つからなければ None を返す（calculate_all が品質判定に使う）。
+    - 公開 find_call_wall / find_put_wall はこれを包んで従来どおり
+      「None→spot ＋ WARNING ログ」を返す（戻り値・挙動とも不変）。
+    - _assess_data_quality() で C/Z/P から data_quality / anomaly_detail を判定。
 """
 
 from __future__ import annotations
@@ -105,29 +112,62 @@ def calculate_gex_per_strike(
 # ──────────────────────────────────────────────────────────
 # Call Wall / Put Wall
 # ──────────────────────────────────────────────────────────
+#
+# 設計メモ（v17）:
+#   Wall は spot 起点に固定して探索する（Call Wall ≥ spot、Put Wall ≤ spot）。
+#   これは PC_CORE §3.2「Call Wall = Pr+α / Put Wall = Pr−β」の定義どおりで、
+#   構造的に C ≥ spot ≥ P ＝ C ≥ P が常に成立する。よって PC_CORE §3.3 の
+#   「P > C → data_error」は本実装では発火しない。
+#   本実装での「データ品質エラー」の真の信号は『Wall が見つからない
+#   （= フォールバックで spot を返す）』こと。これを観測するため、
+#   None 返しの内部版 _find_*_wall_opt を分離する。
+
+def _find_call_wall_opt(gex_by_strike: pd.Series, spot: float) -> Optional[float]:
+    """Call Wall 候補。スポット以上で Net GEX が最大（正）のストライク。
+
+    見つからなければ None（呼び出し側＝calculate_all が data_quality 判定に使う）。
+    """
+    above = gex_by_strike[(gex_by_strike.index >= spot) & (gex_by_strike > 0)]
+    if above.empty:
+        return None
+    return float(above.idxmax())
+
+
+def _find_put_wall_opt(gex_by_strike: pd.Series, spot: float) -> Optional[float]:
+    """Put Wall 候補。スポット以下で Net GEX が最小（最も負）のストライク。
+
+    見つからなければ None。
+    """
+    below = gex_by_strike[(gex_by_strike.index <= spot) & (gex_by_strike < 0)]
+    if below.empty:
+        return None
+    return float(below.idxmin())
+
 
 def find_call_wall(gex_by_strike: pd.Series, spot: float) -> float:
     """Call Wall: スポット以上で Net GEX が最大（正）のストライク。
 
     解が無ければ spot を返す（フォールバック）。
+    （挙動は v17 前と不変。内部で _find_call_wall_opt を包むだけ。）
     """
-    above = gex_by_strike[(gex_by_strike.index >= spot) & (gex_by_strike > 0)]
-    if above.empty:
+    cw = _find_call_wall_opt(gex_by_strike, spot)
+    if cw is None:
         logger.warning("No positive GEX above spot; returning spot as Call Wall")
         return spot
-    return float(above.idxmax())
+    return cw
 
 
 def find_put_wall(gex_by_strike: pd.Series, spot: float) -> float:
     """Put Wall: スポット以下で Net GEX が最小（最も負）のストライク。
 
     解が無ければ spot を返す（フォールバック）。
+    （挙動は v17 前と不変。内部で _find_put_wall_opt を包むだけ。）
     """
-    below = gex_by_strike[(gex_by_strike.index <= spot) & (gex_by_strike < 0)]
-    if below.empty:
+    pw = _find_put_wall_opt(gex_by_strike, spot)
+    if pw is None:
         logger.warning("No negative GEX below spot; returning spot as Put Wall")
         return spot
-    return float(below.idxmin())
+    return pw
 
 
 # ──────────────────────────────────────────────────────────
@@ -250,6 +290,70 @@ def find_max_pain(df: pd.DataFrame) -> float:
 
 
 # ──────────────────────────────────────────────────────────
+# data_quality 判定（v17、PC_CORE §3）
+# ──────────────────────────────────────────────────────────
+
+def _assess_data_quality(
+    call_wall: Optional[float],
+    put_wall: Optional[float],
+    zero_gamma: Optional[float],
+) -> tuple[str, Optional[str]]:
+    """C/Z/P から地図の品質を判定する純粋関数。
+
+    引数の call_wall / put_wall は **_find_*_wall_opt の戻り値**（None 可）を
+    そのまま渡す。None は「Wall が見つからずフォールバックした」を意味する。
+
+    判定順（前段が優先 ─ 後段の誤分類を防ぐ）:
+      1. data_error : call_wall か put_wall が None（Wall 不検出）。
+                      ← 現行 spot 固定探索では P>C が起きないため、これが
+                        真のデータ品質エラー信号。Wall 不検出を放置して
+                        zero_gamma と比較すると、データ問題を anomaly と
+                        誤読する（obs.E の罠）。だから最優先で弾く。
+      2. data_error : zero_gamma が None（Brent 解なし ＝ 地図が regime 分割に
+                      使えない）。論点c=c-1。
+      3. anomaly    : zero_gamma > call_wall（Z > C）または
+                      zero_gamma < put_wall（Z < P）。Brent 解が Wall レンジ外
+                      ＝ 構造崩壊（PC_CORE §3.3）。等号（Z==C / Z==P）は
+                      健全側として "ok"。
+      4. ok
+
+    Returns:
+        (data_quality, anomaly_detail)
+        正常時は ("ok", None)。
+    """
+    # 1. Wall フォールバック
+    if call_wall is None or put_wall is None:
+        missing = [
+            name
+            for name, value in (("call_wall", call_wall), ("put_wall", put_wall))
+            if value is None
+        ]
+        return "data_error", f"wall not found (fell back to spot): {', '.join(missing)}"
+
+    # 2. zero_gamma 解なし
+    if zero_gamma is None:
+        return (
+            "data_error",
+            "zero_gamma not found (no net-gamma sign change in search range)",
+        )
+
+    # 3. Z が Wall レンジ外 → anomaly
+    if zero_gamma > call_wall:
+        return (
+            "anomaly",
+            f"Z > C: zero_gamma({zero_gamma:.2f}) > call_wall({call_wall:.2f})",
+        )
+    if zero_gamma < put_wall:
+        return (
+            "anomaly",
+            f"Z < P: zero_gamma({zero_gamma:.2f}) < put_wall({put_wall:.2f})",
+        )
+
+    # 4. 正常
+    return "ok", None
+
+
+# ──────────────────────────────────────────────────────────
 # 統合: 全部計算して GEXResult を返す
 # ──────────────────────────────────────────────────────────
 
@@ -263,7 +367,8 @@ def calculate_all(
 
     Args:
         df: schema 準拠の DataFrame
-        as_of: 基準日
+        as_of: 基準日（= 実取引日 T。a7-A 以降、呼び出し側が df["trade_date"]
+               から取り出して渡す。today を直接渡さないこと ─ obs.F）
         data_source: "mock" / "rest" / "sdk"
         config: 計算設定
 
@@ -272,7 +377,7 @@ def calculate_all(
         ValueError: データが空、または必須情報が欠ける
 
     Returns:
-        GEXResult
+        GEXResult（data_quality / anomaly_detail を含む）
     """
     # スキーマ検証（致命エラーは例外）
     validate(df).raise_if_invalid()
@@ -284,11 +389,26 @@ def calculate_all(
     spot = float(df["underlying_price"].iloc[0])
 
     gex_by_strike = calculate_gex_per_strike(df, as_of, config=config)
-    call_wall = find_call_wall(gex_by_strike, spot)
-    put_wall = find_put_wall(gex_by_strike, spot)
+
+    # Wall は None 可の内部版で取得（data_quality 判定に None を使うため）
+    call_wall_opt = _find_call_wall_opt(gex_by_strike, spot)
+    put_wall_opt = _find_put_wall_opt(gex_by_strike, spot)
     zero_gamma = find_zero_gamma(df, as_of, config=config)
     max_pain = find_max_pain(df)
     total_gex = float(gex_by_strike.sum())
+
+    # data_quality 判定（None ＝ Wall 不検出 を判定に使う）
+    data_quality, anomaly_detail = _assess_data_quality(
+        call_wall_opt, put_wall_opt, zero_gamma
+    )
+    if data_quality != "ok":
+        # 「異常を検出した」事実をログに残す（PC_VALIDATION §1.6 / §3.4 の方針）
+        logger.warning("data_quality=%s: %s", data_quality, anomaly_detail)
+
+    # GEXResult の数値フィールドは従来どおり float（None はフォールバック spot）。
+    # ← JSON 出力の数値・既存テスト（np.isfinite）の後方互換を保つ。
+    call_wall = call_wall_opt if call_wall_opt is not None else spot
+    put_wall = put_wall_opt if put_wall_opt is not None else spot
 
     return GEXResult(
         symbol=symbol,
@@ -301,4 +421,6 @@ def calculate_all(
         total_gex=total_gex,
         n_contracts_used=int(df["open_interest"].sum()),
         data_source=data_source,
+        data_quality=data_quality,
+        anomaly_detail=anomaly_detail,
     )
