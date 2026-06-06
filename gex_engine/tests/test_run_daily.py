@@ -153,7 +153,11 @@ class TestSideEffects:
         assert json_files[0].parent == tmp_path
 
     def test_json_contains_expected_fields(self, tmp_path, monkeypatch):
-        """出力 JSON が v12 セクション 8-5 の 13 フィールドを含む。"""
+        """出力 JSON が v17 の 12 フィールドを含む（正常時 = anomaly_detail なし）。
+
+        v17 で regime / regime_text を削除し、data_quality を追加。
+        正常な mock 実行では data_quality="ok" なので anomaly_detail は出ない。
+        """
         import json
 
         monkeypatch.chdir(tmp_path)
@@ -169,12 +173,14 @@ class TestSideEffects:
         entry = history[date_key]
 
         expected = {
+            "data_quality",
             "call_wall", "put_wall", "zero_gamma", "max_pain",
-            "underlying_price", "total_gex", "regime", "regime_text",
+            "underlying_price", "total_gex",
             "timestamp", "data_source", "symbol", "as_of",
             "n_contracts_used",
         }
         assert set(entry.keys()) == expected
+        assert entry["data_quality"] == "ok"
         assert entry["data_source"] == "mock"
         assert entry["symbol"] == "SPY"
 
@@ -208,6 +214,11 @@ class TestOIDistributionLogging:
 
         実 API は叩けないので、ThetaRestAdapter.get_option_chain を
         Mock の合成データに差し替えて検証。
+
+        obs.G 後は run_daily が next_business_day(trade_date,
+        fetcher.schedule_type_on) で session_date を求めるため、
+        schedule_type_on も差し替えてカレンダーの生 HTTP を断つ
+        （Terminal 非依存にする）。
         """
         import logging as _logging
         monkeypatch.chdir(tmp_path)
@@ -222,6 +233,10 @@ class TestOIDistributionLogging:
             ThetaRestAdapter,
             "get_option_chain",
             return_value=sample_df,
+        ), patch.object(
+            ThetaRestAdapter,
+            "schedule_type_on",
+            return_value="open",   # 取引日扱い → next_business_day が生 HTTP を叩かない
         ):
             with caplog.at_level(_logging.INFO):
                 result = main()

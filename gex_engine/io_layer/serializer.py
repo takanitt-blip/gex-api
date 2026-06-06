@@ -5,7 +5,15 @@ GEXResult → JSON 出力用 dict への変換
   - GEX のスケール変換（素の単位 → × S² × 0.01）
   - 各値の桁数丸め（論点E: 値ごとに桁数最適化）
   - None の明示的な null 化
-  - 日付キーの生成（論点C: ドット区切り、ET 基準）
+  - 日付キーの生成（論点C: ドット区切り。session_date ベース、obs.G 根治後。
+    キーは呼び出し側が market_calendar.next_business_day で算出して渡す）
+
+v17 変更（data_quality 導入）:
+  - data_quality を出力の先頭に配置（EA が最初に読む）。
+  - anomaly_detail は異常時のみ出力（"ok" のときキー自体を出さない）。
+  - regime / regime_text の出力を削除（Python は regime を判定しない。
+    判定は EA の責務 ─ PC_CORE §2.1）。_derive_regime も削除。
+  - obs.G 根治で不要になった ET_TZ（死にコード）を撤去。
 
 純粋関数（ファイル I/O なし）。テスト容易性のため独立。
 """
@@ -13,21 +21,8 @@ GEXResult → JSON 出力用 dict への変換
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
-
-
-# ============================================================
-# タイムゾーン定数
-# ============================================================
-# ET（米国東部時間）: 夏時間中は UTC-4、標準時は UTC-5
-# zoneinfo で DST を正確に扱う
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-    ET_TZ = ZoneInfo("America/New_York")
-except ImportError:  # pragma: no cover
-    # フォールバック: 固定オフセット（DST を考慮しない）
-    ET_TZ = timezone(timedelta(hours=-5))
 
 
 # ============================================================
@@ -113,26 +108,6 @@ def _to_int_or_none(value: Optional[float]) -> Optional[int]:
 
 
 # ============================================================
-# レジーム判定（既存 update_gex.py 互換の最小実装）
-# ============================================================
-def _derive_regime(scaled_total_gex: float) -> tuple[str, str]:
-    """
-    Total GEX の符号からレジーム判定。
-
-    注意:
-      - これは v11 セクション9 で「Step 1B 予定」とされた静的判定の
-        最小実装。Step 1B では「現在価格 vs Wall/Zero Gamma」の
-        位置関係も加味した 4 状態判定に拡張される。
-      - ここでは既存 update_gex.py 互換のため total_gex の符号のみで判定。
-      - スケール変換は符号を変えないため、scaled でも raw でも結果は同じ。
-    """
-    if scaled_total_gex > 0:
-        return "range", "レンジ相場・低ボラティリティ"
-    else:
-        return "trend", "トレンド相場・高ボラティリティ"
-
-
-# ============================================================
 # メイン関数
 # ============================================================
 def serialize_result(
@@ -146,15 +121,17 @@ def serialize_result(
 
     実 GEXResult の構造（gex_engine.core.result.GEXResult、frozen dataclass）:
         - symbol: str
-        - as_of: str                    # ISO 8601 文字列
+        - as_of: str                    # ISO 8601 文字列（= 実取引日 T）
         - underlying_price: float
         - call_wall: float
         - put_wall: float
         - zero_gamma: float | None      # 解なしのとき None
-        - max_pain: float               # 数学的に必ず解あり（None 不可）
+        - max_pain: float
         - total_gex: float              # 素の単位（gamma × OI × 100）
         - n_contracts_used: int
         - data_source: str              # Adapter から伝搬
+        - data_quality: str             # "ok" / "data_error" / "anomaly"
+        - anomaly_detail: str | None    # 異常時のみ。正常時 None
 
     Args:
         result: GEXResult インスタンス（または dict / 任意オブジェクト）
@@ -164,7 +141,8 @@ def serialize_result(
         now_utc: 現在時刻（テスト用に注入可能）
 
     Returns:
-        EA 互換のフラット dict + 分析用フィールド
+        EA 互換のフラット dict + 分析用フィールド。
+        data_quality が先頭。anomaly_detail は異常時のみ含む。
     """
     # dataclass でも dict でも受け付けられるよう正規化
     if is_dataclass(result):
@@ -187,12 +165,6 @@ def serialize_result(
     # スケール変換
     scaled_total_gex = scale_total_gex(raw_total_gex, spot)
 
-    # レジーム判定（GEXResult が既に持っていればそれを優先、なければ導出）
-    regime = d.get("regime")
-    regime_text = d.get("regime_text")
-    if regime is None or regime_text is None:
-        regime, regime_text = _derive_regime(scaled_total_gex)
-
     # data_source 解決: 引数 > GEXResult.data_source > "unknown"
     # Core Logic が伝搬した値を優先（DRY 原則）。
     # 引数を明示的に渡された場合のみ override。
@@ -202,7 +174,20 @@ def serialize_result(
         else d.get("data_source", "unknown")
     )
 
-    return {
+    # data_quality は GEXResult が必ず持つ。欠けている入力（非 GEXResult の
+    # 生 dict 等）は None のまま null 出力する ─ "ok" を黙ってデフォルトしない。
+    # null は EA 側で != "ok" として全戦略 OFF に倒れる「目に見える失敗」になる。
+    data_quality = d.get("data_quality")
+    anomaly_detail = d.get("anomaly_detail")
+
+    # data_quality を先頭に置く（dict の挿入順 = JSON のキー順）
+    out: Dict[str, Any] = {"data_quality": data_quality}
+
+    # anomaly_detail は異常時のみ出力（正常時はキー自体を出さない）
+    if anomaly_detail is not None:
+        out["anomaly_detail"] = anomaly_detail
+
+    out.update({
         # 価格水準（小数 2 桁）
         "call_wall":        _round_or_none(d.get("call_wall"),        2),
         "put_wall":         _round_or_none(d.get("put_wall"),         2),
@@ -215,8 +200,6 @@ def serialize_result(
         "total_gex":        _to_int_or_none(scaled_total_gex),
 
         # メタ
-        "regime":           regime,
-        "regime_text":      regime_text,
         "timestamp":        make_timestamp(now_utc),
         "data_source":      actual_data_source,
 
@@ -224,4 +207,6 @@ def serialize_result(
         "symbol":           d.get("symbol"),
         "as_of":            d.get("as_of"),
         "n_contracts_used": d.get("n_contracts_used"),
-    }
+    })
+
+    return out

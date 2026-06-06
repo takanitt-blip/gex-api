@@ -16,6 +16,9 @@ from gex_engine.core.gex import (
     find_max_pain,
     find_put_wall,
     find_zero_gamma,
+    _assess_data_quality,     
+    _find_call_wall_opt,      
+    _find_put_wall_opt,
 )
 from gex_engine.core.result import GEXResult
 
@@ -236,3 +239,94 @@ class TestRobustness:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+# ──────────────────────────────────────────────────────────
+# data_quality 判定（v17）
+# ──────────────────────────────────────────────────────────
+
+class TestDataQuality:
+    """_assess_data_quality の純粋ロジックと calculate_all への統合。"""
+
+    # --- 純粋関数の単体テスト（判定順を含む） ---
+
+    def test_ok_when_c_ge_z_ge_p(self):
+        dq, detail = _assess_data_quality(call_wall=745.0, put_wall=730.0, zero_gamma=740.0)
+        assert dq == "ok"
+        assert detail is None
+
+    def test_ok_at_boundary_z_equals_c(self):
+        """Z == C は健全側（"ok"）。"""
+        dq, _ = _assess_data_quality(call_wall=740.0, put_wall=730.0, zero_gamma=740.0)
+        assert dq == "ok"
+
+    def test_ok_at_boundary_z_equals_p(self):
+        """Z == P は健全側（"ok"）。"""
+        dq, _ = _assess_data_quality(call_wall=745.0, put_wall=730.0, zero_gamma=730.0)
+        assert dq == "ok"
+
+    def test_data_error_when_call_wall_missing(self):
+        dq, detail = _assess_data_quality(call_wall=None, put_wall=730.0, zero_gamma=740.0)
+        assert dq == "data_error"
+        assert "call_wall" in detail
+
+    def test_data_error_when_put_wall_missing(self):
+        dq, detail = _assess_data_quality(call_wall=745.0, put_wall=None, zero_gamma=740.0)
+        assert dq == "data_error"
+        assert "put_wall" in detail
+
+    def test_data_error_takes_precedence_over_anomaly(self):
+        """Wall 不検出は zero_gamma の位置より優先（obs.E の誤分類を防ぐ）。"""
+        dq, detail = _assess_data_quality(call_wall=None, put_wall=730.0, zero_gamma=999.0)
+        assert dq == "data_error"
+
+    def test_data_error_when_zero_gamma_none(self):
+        """論点 c=c-1: zero_gamma 解なしは data_error。"""
+        dq, detail = _assess_data_quality(call_wall=745.0, put_wall=730.0, zero_gamma=None)
+        assert dq == "data_error"
+        assert "zero_gamma" in detail
+
+    def test_anomaly_when_z_above_c(self):
+        dq, detail = _assess_data_quality(call_wall=740.0, put_wall=730.0, zero_gamma=742.0)
+        assert dq == "anomaly"
+        assert "Z > C" in detail
+
+    def test_anomaly_when_z_below_p(self):
+        dq, detail = _assess_data_quality(call_wall=745.0, put_wall=730.0, zero_gamma=725.0)
+        assert dq == "anomaly"
+        assert "Z < P" in detail
+
+    # --- calculate_all への統合テスト ---
+
+    def test_normal_mock_is_ok(self):
+        """正常な Mock データは data_quality="ok"、anomaly_detail=None。"""
+        df = generate_option_chain(spot_price=450.0, seed=42)
+        result = calculate_all(df, as_of=date.today())
+        assert result.data_quality == "ok"
+        assert result.anomaly_detail is None
+
+    def test_wall_fallback_yields_data_error_via_calculate_all(self):
+        """Put のみのチェーンは spot 以上の正 GEX が無く Call Wall が
+        フォールバック → calculate_all が data_error を返す。"""
+        df = generate_option_chain(spot_price=450.0, seed=42)
+        df_puts = df[df["right"] == "put"].copy()
+        result = calculate_all(df_puts, as_of=date.today())
+        assert result.data_quality == "data_error"
+        assert result.call_wall == result.underlying_price
+
+    # --- 内部ヘルパー（None 返し）の確認 ---
+
+    def test_find_call_wall_opt_returns_none_on_fallback(self):
+        gex = pd.Series(
+            [-100.0, -200.0, -150.0],
+            index=pd.Index([440.0, 450.0, 460.0], name="strike"),
+            name="net_gex",
+        )
+        assert _find_call_wall_opt(gex, spot=450.0) is None
+
+    def test_find_put_wall_opt_returns_none_on_fallback(self):
+        gex = pd.Series(
+            [100.0, 200.0, 150.0],
+            index=pd.Index([440.0, 450.0, 460.0], name="strike"),
+            name="net_gex",
+        )
+        assert _find_put_wall_opt(gex, spot=450.0) is None

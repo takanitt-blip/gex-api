@@ -52,9 +52,9 @@ class FakeGEXResult:
     total_gex: float
     n_contracts_used: int
     data_source: str
-    # serialize_result が見るオプションフィールド（実 GEXResult にはない）
-    regime: Optional[str] = None
-    regime_text: Optional[str] = None
+    # v17: data_quality / anomaly_detail（regime / regime_text は廃止）
+    data_quality: str = "ok"
+    anomaly_detail: Optional[str] = None
 
 
 # ============================================================
@@ -69,7 +69,7 @@ class TestScaleTotalGex(unittest.TestCase):
         self.assertEqual(scale_total_gex(0.0, 450.0), 0.0)
 
     def test_negative_raw_preserves_sign(self):
-        # 符号が保たれることを確認（レジーム判定に必須）
+        # 符号が保たれることを確認（data_quality 判定や分析に必須）
         self.assertEqual(scale_total_gex(-100.0, 450.0), -202500.0)
 
     def test_typical_spy_scale(self):
@@ -154,9 +154,8 @@ class TestSerializeResult(unittest.TestCase):
         self.assertEqual(out["data_source"], "mock")  # GEXResult 由来
         self.assertEqual(out["timestamp"], "2026-05-09T22:30:15Z")
 
-        # 自動導出されたレジーム
-        self.assertEqual(out["regime"], "range")
-        self.assertIn("レンジ", out["regime_text"])
+        # data_quality（regime は v17 で廃止、判定は EA の責務）
+        self.assertEqual(out["data_quality"], "ok")
 
         # 分析用フィールド
         self.assertEqual(out["symbol"], "SPY")
@@ -176,6 +175,7 @@ class TestSerializeResult(unittest.TestCase):
             "total_gex": 6421.0,
             "n_contracts_used": 12345,
             "data_source": "rest",
+            "data_quality": "ok",
         }
         out = serialize_result(result_dict)
         self.assertEqual(out["call_wall"], 465.0)
@@ -206,6 +206,7 @@ class TestSerializeResult(unittest.TestCase):
             "total_gex": 6421.0,
             "n_contracts_used": 1000,
             "data_source": "mock",
+            "data_quality": "ok",
         }
         out = serialize_result(result_dict)
         self.assertIsNone(out["max_pain"])
@@ -221,20 +222,21 @@ class TestSerializeResult(unittest.TestCase):
         out = serialize_result(result)
         self.assertIsNone(out["zero_gamma"])
 
-    def test_negative_total_gex_yields_trend_regime(self):
-        result = self._make_fake_result(total_gex=-6421.0)
-        out = serialize_result(result)
-        self.assertEqual(out["regime"], "trend")
-        self.assertIn("トレンド", out["regime_text"])
-
-    def test_explicit_regime_overrides_derived(self):
-        # GEXResult が regime を持っていればそれを尊重
+    def test_data_quality_passthrough(self):
+        # serializer は data_quality / anomaly_detail を素通しする（v17）
         result = self._make_fake_result()
-        result.regime = "custom"
-        result.regime_text = "カスタムレジーム"
+        result.data_quality = "anomaly"
+        result.anomaly_detail = "Z > C: zero_gamma(742.10) > call_wall(740.00)"
         out = serialize_result(result)
-        self.assertEqual(out["regime"], "custom")
-        self.assertEqual(out["regime_text"], "カスタムレジーム")
+        self.assertEqual(out["data_quality"], "anomaly")
+        self.assertEqual(out["anomaly_detail"], result.anomaly_detail)
+
+    def test_ok_omits_anomaly_detail(self):
+        # 正常時（"ok"）は anomaly_detail のキー自体を出さない
+        result = self._make_fake_result()   # data_quality="ok"
+        out = serialize_result(result)
+        self.assertEqual(out["data_quality"], "ok")
+        self.assertNotIn("anomaly_detail", out)
 
     def test_missing_required_fields_raises(self):
         with self.assertRaises(ValueError):
@@ -331,14 +333,13 @@ class TestLoadHistory(unittest.TestCase):
 class TestMergeEntry(unittest.TestCase):
     def _make_entry(self, call_wall=465.0):
         return {
+            "data_quality": "ok",
             "call_wall": call_wall,
             "put_wall": 435.0,
             "zero_gamma": 441.69,
             "max_pain": 450.0,
             "underlying_price": 450.0,
             "total_gex": 13002525,
-            "regime": "range",
-            "regime_text": "レンジ相場・低ボラティリティ",
             "timestamp": "2026-05-09T22:30:15Z",
             "data_source": "mock",
         }
@@ -472,13 +473,13 @@ class TestWriteJsonAtomic(unittest.TestCase):
         self.assertEqual(loaded, data)
 
     def test_japanese_preserved(self):
-        data = {"regime_text": "レンジ相場・低ボラティリティ"}
+        data = {"anomaly_detail": "市場の構造的崩壊（Z > C）"}
         write_json_atomic(self.path, data)
 
         with open(self.path, encoding="utf-8") as f:
             content = f.read()
         # ensure_ascii=False なので日本語がそのまま
-        self.assertIn("レンジ相場", content)
+        self.assertIn("市場の構造的崩壊", content)
 
     def test_overwrite_existing(self):
         write_json_atomic(self.path, {"v": 1})
@@ -655,6 +656,9 @@ class TestSaveGexResultIntegration(unittest.TestCase):
         self.assertIn('"total_gex":', content)
         self.assertIn('"timestamp":', content)
         self.assertIn('"data_source":', content)
+
+        # v17: data_quality が含まれている
+        self.assertIn('"data_quality":', content)
 
 
 if __name__ == "__main__":

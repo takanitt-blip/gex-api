@@ -3,7 +3,7 @@ end-to-end スモークテスト（段階3.5）
 
 目的:
     Mock Adapter → calculate_all → save_gex_result の一気通貫で動作確認。
-    134 件のユニットテストでは捕まえられない、実コンポーネント同士を
+    ユニットテストでは捕まえられない、実コンポーネント同士を
     繋いだときの統合的な不具合を検出する。
 
 ユニットテストとの違い:
@@ -12,13 +12,14 @@ end-to-end スモークテスト（段階3.5）
 
 合格基準（先に決めた、後出しで増やさない）:
     1. 例外なく完走する
-    2. 出力 JSON のキー数 = 13 個（v12 セクション 8-5 の出力例と一致）
+    2. 出力 JSON のキー数 = 12 個（v17: regime/regime_text 廃止、data_quality 追加。
+       正常時は anomaly_detail を出さないので 12）
     3. call_wall >= spot
     4. put_wall <= spot
     5. put_wall <= zero_gamma <= call_wall
     6. max_pain がストライク範囲（360〜540）内
     7. total_gex が int 型、|total_gex| が 1e6 〜 1e8 のオーダー
-    8. regime が "range"（Mock の対称構造の設計通り）
+    8. data_quality == "ok"（正常な Mock 地図。Z が見つかり C>=Z>=P が成立）
     9. symbol == "SPY"
     10. data_source == "mock"
     11. timestamp が "Z" で終わる ISO 8601
@@ -177,6 +178,8 @@ def run_smoke_test() -> bool:
     info(f"total_gex (素): {result.total_gex:.2f}")
     info(f"n_contracts_used: {result.n_contracts_used}")
     info(f"data_source: {result.data_source}")
+    info(f"data_quality: {result.data_quality}")
+    info(f"anomaly_detail: {result.anomaly_detail}")
 
     # ── ステップ 3: I/O 層で JSON 書き出し ──
     section("ステップ 3: save_gex_result → JSON ファイル")
@@ -235,15 +238,17 @@ def run_smoke_test() -> bool:
 
     e = history[date_key]
 
-    # 出力フィールド数
+    # 出力フィールド数（v17: regime/regime_text 廃止、data_quality 追加。
+    # 正常時は anomaly_detail を出さないので 12 個）
     expected_keys = {
+        "data_quality",
         "call_wall", "put_wall", "zero_gamma", "max_pain", "underlying_price",
-        "total_gex", "regime", "regime_text", "timestamp", "data_source",
+        "total_gex", "timestamp", "data_source",
         "symbol", "as_of", "n_contracts_used",
     }
     runner.check(
-        "出力フィールド数 = 13",
-        lambda: len(e) == 13,
+        "出力フィールド数 = 12",
+        lambda: len(e) == 12,
         detail=f"(実測: {len(e)})",
     )
     runner.check(
@@ -293,11 +298,16 @@ def run_smoke_test() -> bool:
         detail=f"(実測: {tg:,})",
     )
 
-    # メタフィールド
+    # メタフィールド（v17: regime → data_quality）
     runner.check(
-        "regime == 'range' (Mock 対称構造の設計通り)",
-        lambda: e["regime"] == "range",
-        detail=f"(実測: {e['regime']!r})",
+        "data_quality == 'ok' (正常な Mock 地図: Z 検出 & C>=Z>=P)",
+        lambda: e["data_quality"] == "ok",
+        detail=f"(実測: {e['data_quality']!r})",
+    )
+    runner.check(
+        "正常時は anomaly_detail を出力しない",
+        lambda: "anomaly_detail" not in e,
+        detail=f"(キー有無: {'anomaly_detail' in e})",
     )
     runner.check(
         "symbol == 'SPY'",
