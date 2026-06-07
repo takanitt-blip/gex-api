@@ -6,3 +6,4 @@ __pycache__/
 # --- ThetaData 個人購読フィクスチャ（obs.I 事象②: 巻き添え事故の根治）---
 # PC_VALIDATION §2.4: 再配布不可・コミット禁止・CI 非実行・ローカル手動配置
 gex_engine/tests/fixtures/spy_*.csv
+tools/probe_results_*.json
