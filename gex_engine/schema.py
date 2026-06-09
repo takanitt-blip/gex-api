@@ -126,13 +126,13 @@ def validate(df: pd.DataFrame, *, strict_dtypes: bool = False) -> ValidationResu
             ・必須列の欠損
             ・dtype の不一致（strict_dtypes=True 時）
             ・strike <= 0
-            ・bid > ask
             ・IV < 0
             ・right が "call"/"put" 以外
         ソフト警告（warnings）:
             ・OI = 0
             ・IV > 5.0（500%超）
             ・bid = 0 かつ ask = 0
+            ・bid > ask（クロスquote。GEX は γ×OI で計算し bid/ask 不使用のため非致命）
         許容（チェックしない）:
             ・dte = 0
             ・OI が極端に大きい
@@ -178,19 +178,12 @@ def validate(df: pd.DataFrame, *, strict_dtypes: bool = False) -> ValidationResu
             f"Allowed: {sorted(VALID_RIGHTS)}"
         )
 
-    # strike <= 0 は数学的にあり得ない
+    # strike <= 0 は数学的にあり得ない（gamma の K として直接使うため致命）
     n_bad_strike = (df["strike"] <= 0).sum()
     if n_bad_strike > 0:
         errors.append(f"{n_bad_strike} row(s) have strike <= 0")
 
-    # bid > ask は板の論理破綻
-    # 両方が NaN や 0 のケースは別途警告で扱うので、ここでは厳密な不等号のみ
-    bid_gt_ask_mask = (df["bid"] > df["ask"]) & df["bid"].notna() & df["ask"].notna()
-    n_bad_quote = bid_gt_ask_mask.sum()
-    if n_bad_quote > 0:
-        errors.append(f"{n_bad_quote} row(s) have bid > ask (crossed quote)")
-
-    # IV < 0 は数学的にあり得ない
+    # IV < 0 は数学的にあり得ない（gamma の sigma として直接使うため致命）
     n_bad_iv = (df["implied_volatility"] < 0).sum()
     if n_bad_iv > 0:
         errors.append(f"{n_bad_iv} row(s) have implied_volatility < 0")
@@ -214,6 +207,15 @@ def validate(df: pd.DataFrame, *, strict_dtypes: bool = False) -> ValidationResu
     n_no_quote = no_quote_mask.sum()
     if n_no_quote > 0:
         warnings.append(f"{n_no_quote} row(s) have no quote (bid=0 and ask=0)")
+
+    # bid > ask（クロスquote）: 流動性薄・bid/ask 更新のタイミングずれで
+    # ヒストリカルに普通に現れる良性アーティファクト。GEX は γ×OI で計算し
+    # bid/ask を一切使わない（core/gex.py）ため、1 行で 1 日を弾く理由にならない。
+    # WARNING に留め行は残す（その行の strike/IV/OI/right は有効でガンマ地図に寄与）。
+    bid_gt_ask_mask = (df["bid"] > df["ask"]) & df["bid"].notna() & df["ask"].notna()
+    n_bad_quote = bid_gt_ask_mask.sum()
+    if n_bad_quote > 0:
+        warnings.append(f"{n_bad_quote} row(s) have bid > ask (crossed quote)")
 
     # 警告は logger 経由でも流す（呼び出し側の利便性のため）
     for w in warnings:
