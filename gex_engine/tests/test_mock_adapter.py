@@ -167,12 +167,14 @@ class TestAnomalies:
         assert result.is_valid
         assert any("implied_volatility > 5.0" in w for w in result.warnings)
 
-    def test_crossed_quote_anomaly_fails_validation(self):
-        """crossed_quote は validate() で弾かれることを確認。"""
+    def test_crossed_quote_anomaly_warns(self):
+        """crossed_quote は validate() で WARNING 止まり（致命でない）ことを確認。
+        GEX は γ×OI で計算し bid/ask を使わないため、1 行のクロスquoteで
+        日を弾かない（schema: bid>ask を errors→warnings に降格）。"""
         df = generate_with_anomaly("crossed_quote", spot_price=450.0)
         result = validate(df)
-        assert not result.is_valid
-        assert any("bid > ask" in e for e in result.errors)
+        assert result.is_valid
+        assert any("bid > ask" in w for w in result.warnings)
 
     def test_unknown_anomaly_raises(self):
         with pytest.raises(ValueError, match="Unknown anomaly_type"):
