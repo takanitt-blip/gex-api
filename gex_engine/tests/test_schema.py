@@ -104,15 +104,6 @@ class TestHardErrors:
         result = validate(df)
         assert not result.is_valid
 
-    def test_crossed_quote(self):
-        """bid > ask は板の論理破綻。"""
-        df = make_valid_df()
-        df.loc[0, "bid"] = 2.0
-        df.loc[0, "ask"] = 1.0
-        result = validate(df)
-        assert not result.is_valid
-        assert any("bid > ask" in e for e in result.errors)
-
     def test_negative_iv(self):
         df = make_valid_df()
         df.loc[0, "implied_volatility"] = -0.1
@@ -161,6 +152,17 @@ class TestSoftWarnings:
         result = validate(df)
         assert result.is_valid
         assert any("no quote" in w for w in result.warnings)
+
+    def test_crossed_quote_warns(self):
+        """bid > ask（クロスquote）は良性アーティファクト。GEX は γ×OI で
+        計算し bid/ask を使わない（core/gex.py）ため非致命 ─ WARNING 止まりで
+        日は通す。"""
+        df = make_valid_df()
+        df.loc[0, "bid"] = 2.0
+        df.loc[0, "ask"] = 1.0
+        result = validate(df)
+        assert result.is_valid
+        assert any("bid > ask" in w for w in result.warnings)
 
     def test_dte_zero_does_not_warn(self):
         """当日満期は正常な状態。dte は推奨カラムなのでチェック対象外。"""
