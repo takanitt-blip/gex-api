@@ -385,6 +385,19 @@ def calculate_all(
     if len(df) == 0:
         raise ValueError("Cannot calculate GEX from empty DataFrame")
 
+    # 当日満期/期限切れ（expiration <= as_of, DTE<=0）を除外（誤判断32）。
+    # 地図は EOD(T) から計算され翌セッション T+1 をガバナンスする。expiration <= as_of の
+    # 建玉は T 引けで消滅済み＝翌セッションには存在せず、かつ T→0 で γ が床値まで爆発する
+    # 退化 greeks。これらが per-strike Net GEX の argmax を spot 近傍にピンさせ、Zero Gamma
+    # （本体は長期物の符号反転）との DTE 不整合から Z∉[P,C] anomaly を量産していた。
+    # T+1 満期（セッションの 0DTE）は expiration > as_of なので DTE=1 で保持される。
+    as_of_ts = pd.Timestamp(as_of)
+    df = df[df["expiration"] > as_of_ts]
+    if len(df) == 0:
+        raise ValueError(
+            f"No live options after excluding expiration <= as_of ({as_of_ts.date()})"
+        )
+
     symbol = str(df["symbol"].iloc[0])
     spot = float(df["underlying_price"].iloc[0])
 
