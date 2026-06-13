@@ -24,6 +24,8 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Optional
 
+from gex_engine.core.gex import derive_z_position
+
 
 # ============================================================
 # スケール変換（論点A の決定事項）
@@ -187,13 +189,23 @@ def serialize_result(
     if anomaly_detail is not None:
         out["anomaly_detail"] = anomaly_detail
 
+    # 価格水準は丸め値を z_position 派生と出力で共用（migration が同じ丸め値から
+    # 再導出しても一致するように＝raw/rounded 不一致を排除）。
+    rounded_cw = _round_or_none(d.get("call_wall"), 2)
+    rounded_pw = _round_or_none(d.get("put_wall"), 2)
+    rounded_zg = _round_or_none(d.get("zero_gamma"), 2)
+
     out.update({
         # 価格水準（小数 2 桁）
-        "call_wall":        _round_or_none(d.get("call_wall"),        2),
-        "put_wall":         _round_or_none(d.get("put_wall"),         2),
-        "zero_gamma":       _round_or_none(d.get("zero_gamma"),       2),
+        "call_wall":        rounded_cw,
+        "put_wall":         rounded_pw,
+        "zero_gamma":       rounded_zg,
         "max_pain":         _round_or_none(d.get("max_pain"),         2),
         "underlying_price": _round_or_none(spot,                      2),
+
+        # Z と Wall レンジの位置関係（誤判断32）。品質ではなく地図の構造タグ。
+        # "inside" / "above_call" / "below_put" / None(=C/P/Z 欠＝data_error)。
+        "z_position":       derive_z_position(rounded_cw, rounded_pw, rounded_zg),
 
         # GEX 値（整数、スケール変換済み × S^2 × 0.01）
         # int 変換で JSON 上 "13004123" と表記（".0" 抑止で可読性 ↑）

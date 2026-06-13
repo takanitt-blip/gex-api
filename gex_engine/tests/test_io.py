@@ -238,6 +238,24 @@ class TestSerializeResult(unittest.TestCase):
         self.assertEqual(out["data_quality"], "ok")
         self.assertNotIn("anomaly_detail", out)
 
+    def test_z_position_inside_by_default(self):
+        # 既定 C=465 / P=435 / Z=441.69 は整序 → "inside"（誤判断32）
+        out = serialize_result(self._make_fake_result())
+        self.assertEqual(out["z_position"], "inside")
+
+    def test_z_position_above_call(self):
+        out = serialize_result(self._make_fake_result(zero_gamma=470.0))  # Z>C(465)
+        self.assertEqual(out["z_position"], "above_call")
+        self.assertEqual(out["data_quality"], "ok")  # 品質は ok のまま
+
+    def test_z_position_below_put(self):
+        out = serialize_result(self._make_fake_result(zero_gamma=430.0))  # Z<P(435)
+        self.assertEqual(out["z_position"], "below_put")
+
+    def test_z_position_none_when_zero_gamma_missing(self):
+        out = serialize_result(self._make_fake_result(zero_gamma=None))
+        self.assertIsNone(out["z_position"])
+
     def test_missing_required_fields_raises(self):
         with self.assertRaises(ValueError):
             serialize_result({"call_wall": 465.0})  # spot, total_gex 欠落
