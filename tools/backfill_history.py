@@ -16,10 +16,12 @@
      df["trade_date"] == D を確認して、ズレを即検出する。
 
   3. 冪等性 × 上書きの統一:
-     スキップ = 既存キーが v17形式（data_quality を持つ）かつ data_source ∈
-                {rest, rest_backfill} = 現行の正しいパイプライン産。再取得しない。
+     通常 skip = 既存キーが v17形式（data_quality を持つ）かつ data_source ∈
+                {rest, rest_backfill, rest_backfill_v2} = 現行パイプライン産。再取得しない。
+     --force skip = v2（rest_backfill_v2 ＝ 誤判断32 修正後の再計算済み）のみ。
+                stale な rest_backfill / rest / 不在は再計算する（分割実行の自動レジューム）。
      上書き   = それ以外（regime形式 = snapshot汚染/obs.F期、または不在）。
-     backfill が書くエントリの data_source は "rest_backfill"（provenance タグ）。
+     backfill が書く data_source は "rest_backfill_v2"（誤判断32 以降の provenance タグ）。
 
   4. キー意味論（obs.G 案2 = session-served）:
      JSON キー = next_business_day(trade_date)。営業日リストの successor で O(1) 算出。
@@ -95,7 +97,7 @@ DEFAULT_LOOKBACK_DAYS = 365 * 2          # 既定2年（3年は --start で）
 LIST_BUFFER_DAYS = 10                    # successor 確保用に範囲末より先まで走査
 RESOLVE_BACK_SCAN_DAYS = 10             # 直近完了取引日を探す過去向き上限
 
-BACKFILL_DATA_SOURCE = "rest_backfill"
+BACKFILL_DATA_SOURCE = "rest_backfill_v2"  # 誤判断32（当日満期除外）以降の再計算分
 
 # ネットワーク断の検知＆復帰待ち（誤判断: DNS 断で偽 failed 量産の再発防止）
 NETWORK_SUSPECT_CONSECUTIVE = 3          # fatal が連続 N 回 → 断を疑う
@@ -179,16 +181,34 @@ def build_trading_days(
 # ──────────────────────────────────────────────────────────
 
 def is_current_pipeline_entry(entry: object) -> bool:
-    """既存エントリが「現行の正しいパイプライン産」か判定する。
+    """既存エントリが「現行パイプライン産（通常 run では再取得不要）」か判定する。
 
-    True = v17形式（data_quality を持つ）かつ data_source ∈ {rest, rest_backfill}。
+    True = v17形式（data_quality を持つ）かつ data_source ∈
+           {rest, rest_backfill, rest_backfill_v2}。
     False = regime形式（snapshot汚染 / obs.F期）や mock / 不明 → 上書き対象。
+
+    通常（非 force）run はこの集合を skip する。stale な rest_backfill（誤判断32 前の
+    計算）も「通常は再取得しない」ため、修正再 backfill は明示的に --force で行う。
     """
     if not isinstance(entry, dict):
         return False
     if entry.get("data_quality") is None:  # v17 で導入。pre-v17 は regime のみ
         return False
-    return entry.get("data_source") in ("rest", BACKFILL_DATA_SOURCE)
+    return entry.get("data_source") in ("rest", "rest_backfill", "rest_backfill_v2")
+
+
+def is_recomputed_entry(entry: object) -> bool:
+    """誤判断32 修正後の再計算で書かれた v2 エントリか判定する。
+
+    --force 時の skip 集合。force は「v2 でない日（stale rest_backfill / rest /
+    不在）だけ再計算」とし、既に v2 の日は skip する。これにより --force --limit の
+    分割実行が自動レジュームになり、正しい day を無駄に再構築しない。
+    """
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("data_quality") is None:
+        return False
+    return entry.get("data_source") == BACKFILL_DATA_SOURCE
 
 
 def _probe_network(fetcher: ThetaRestAdapter, probe_date: date) -> bool:
@@ -274,9 +294,15 @@ def run_backfill(
         prefix = f"[{i}/{total}] D={D} key={key}"
 
         # ── スキップ判定（fetch 前。済みなら取得を省く）──
+        # 通常: 現行パイプライン産（rest/backfill/v2）を skip。
+        # force: v2（修正後再計算済み）のみ skip ＝ stale 日だけ再計算（自動レジューム）。
         existing = history.get(key)
-        if existing is not None and is_current_pipeline_entry(existing) and not force:
-            logger.info("%s SKIP（v17・現行パイプライン産）", prefix)
+        already_done = (
+            is_recomputed_entry(existing) if force
+            else is_current_pipeline_entry(existing)
+        )
+        if existing is not None and already_done:
+            logger.info("%s SKIP（%s）", prefix, "v2・再計算済み" if force else "v17・現行産")
             skipped.append(D)
             continue
 
