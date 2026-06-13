@@ -17,6 +17,7 @@ from gex_engine.core.gex import (
     find_put_wall,
     find_zero_gamma,
     _assess_data_quality,     
+    derive_z_position,
     _find_call_wall_opt,      
     _find_put_wall_opt,
 )
@@ -285,15 +286,37 @@ class TestDataQuality:
         assert dq == "data_error"
         assert "zero_gamma" in detail
 
-    def test_anomaly_when_z_above_c(self):
+    def test_z_above_c_is_ok_not_anomaly(self):
+        """誤判断32: Z > C は品質欠陥ではなく regime 構造 → "ok"（旧 anomaly 廃止）。"""
         dq, detail = _assess_data_quality(call_wall=740.0, put_wall=730.0, zero_gamma=742.0)
-        assert dq == "anomaly"
-        assert "Z > C" in detail
+        assert dq == "ok"
+        assert detail is None
 
-    def test_anomaly_when_z_below_p(self):
+    def test_z_below_p_is_ok_not_anomaly(self):
+        """誤判断32: Z < P も "ok"（構造は z_position で記述）。"""
         dq, detail = _assess_data_quality(call_wall=745.0, put_wall=730.0, zero_gamma=725.0)
-        assert dq == "anomaly"
-        assert "Z < P" in detail
+        assert dq == "ok"
+        assert detail is None
+
+    # --- z_position（地図の構造タグ。data_quality とは別レイヤー） ---
+
+    def test_z_position_inside(self):
+        assert derive_z_position(call_wall=745.0, put_wall=730.0, zero_gamma=740.0) == "inside"
+
+    def test_z_position_boundary_is_inside(self):
+        """Z==C / Z==P は inside（整序側）。"""
+        assert derive_z_position(740.0, 730.0, 740.0) == "inside"
+        assert derive_z_position(745.0, 730.0, 730.0) == "inside"
+
+    def test_z_position_above_call(self):
+        assert derive_z_position(call_wall=740.0, put_wall=730.0, zero_gamma=742.0) == "above_call"
+
+    def test_z_position_below_put(self):
+        assert derive_z_position(call_wall=745.0, put_wall=730.0, zero_gamma=725.0) == "below_put"
+
+    def test_z_position_none_when_inputs_missing(self):
+        assert derive_z_position(call_wall=None, put_wall=730.0, zero_gamma=740.0) is None
+        assert derive_z_position(call_wall=745.0, put_wall=730.0, zero_gamma=None) is None
 
     # --- calculate_all への統合テスト ---
 

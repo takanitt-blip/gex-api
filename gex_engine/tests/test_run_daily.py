@@ -175,12 +175,13 @@ class TestSideEffects:
         expected = {
             "data_quality",
             "call_wall", "put_wall", "zero_gamma", "max_pain",
-            "underlying_price", "total_gex",
+            "underlying_price", "total_gex", "z_position",
             "timestamp", "data_source", "symbol", "as_of",
             "n_contracts_used",
         }
         assert set(entry.keys()) == expected
         assert entry["data_quality"] == "ok"
+        assert entry["z_position"] == "inside"  # 正常な mock は整序
         assert entry["data_source"] == "mock"
         assert entry["symbol"] == "SPY"
 

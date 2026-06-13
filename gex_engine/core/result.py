@@ -37,14 +37,14 @@ class GEXResult:
         total_gex: ネット GEX 合計（素の単位。serializer がスケール変換）
         n_contracts_used: 計算に使ったコントラクト数
         data_source: "mock" / "rest" / "sdk"
-        data_quality: 地図の品質（PC_CORE §3）。
-            "ok"          C >= Z >= P が成立、地図は使用可能
+        data_quality: 地図の品質（PC_CORE §3 / 誤判断32）。データ欠陥のみを表す。
+            "ok"          Wall と zero_gamma が計算でき、地図は使用可能
             "data_error"  Wall が見つからずフォールバック、または zero_gamma 解なし
-                          （現行の spot 固定 Wall 探索では P>C は構造的に
-                            起きないため、Wall 不検出が真のデータ品質エラー信号。
-                            PC_CORE §3.3 の「P>C」文面は doc 側で要再整合）
-            "anomaly"     Z > C または Z < P（Brent 解が Wall レンジ外 ＝ 構造崩壊）
-        anomaly_detail: 異常時の自由形式説明。正常時（"ok"）は None。
+            （Z と Wall の位置関係 Z∉[P,C] は品質欠陥ではなく regime 構造。
+              data_quality では判定せず z_position 派生で記述する。旧 "anomaly"
+              （Z>C / Z<P）は誤判断32 で廃止 ─ 当日満期混入による壁の spot ピンが
+              主因で市場崩壊ではなかった。）
+        anomaly_detail: data_error 時の自由形式説明。正常時（"ok"）は None。
     """
 
     symbol: str

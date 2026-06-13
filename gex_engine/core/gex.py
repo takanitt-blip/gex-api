@@ -311,11 +311,11 @@ def _assess_data_quality(
                         誤読する（obs.E の罠）。だから最優先で弾く。
       2. data_error : zero_gamma が None（Brent 解なし ＝ 地図が regime 分割に
                       使えない）。論点c=c-1。
-      3. anomaly    : zero_gamma > call_wall（Z > C）または
-                      zero_gamma < put_wall（Z < P）。Brent 解が Wall レンジ外
-                      ＝ 構造崩壊（PC_CORE §3.3）。等号（Z==C / Z==P）は
-                      健全側として "ok"。
-      4. ok
+      3. ok          : それ以外。Z と Wall の位置関係（Z∉[P,C]）は regime 構造で
+                      あって品質欠陥ではないため判定しない（誤判断32：当日満期
+                      混入が壁を spot にピンさせ Z∉[P,C] を量産していたが、当日
+                      満期除外で大半が解消。残る非整序も崩壊ではなく実在配置）。
+                      構造は z_position（C/Z/P からの派生）で記述する。
 
     Returns:
         (data_quality, anomaly_detail)
@@ -337,20 +337,36 @@ def _assess_data_quality(
             "zero_gamma not found (no net-gamma sign change in search range)",
         )
 
-    # 3. Z が Wall レンジ外 → anomaly
-    if zero_gamma > call_wall:
-        return (
-            "anomaly",
-            f"Z > C: zero_gamma({zero_gamma:.2f}) > call_wall({call_wall:.2f})",
-        )
-    if zero_gamma < put_wall:
-        return (
-            "anomaly",
-            f"Z < P: zero_gamma({zero_gamma:.2f}) < put_wall({put_wall:.2f})",
-        )
-
-    # 4. 正常
+    # 3. 正常。Z と Wall の位置関係（Z∉[P,C]）は regime 構造であって品質欠陥では
+    #    ないため、ここでは判定しない（誤判断32）。構造は z_position（C/Z/P からの
+    #    派生）で記述し、data_quality は {ok, data_error} に限定する。
     return "ok", None
+
+
+def derive_z_position(
+    call_wall: Optional[float],
+    put_wall: Optional[float],
+    zero_gamma: Optional[float],
+) -> Optional[str]:
+    """Zero Gamma と Wall レンジの位置関係を記述する純粋関数（誤判断32）。
+
+    data_quality（品質欠陥）とは別レイヤーの「地図の構造タグ」。整序
+    （P ≤ Z ≤ C）か、Z が Wall レンジから出た非整序かを表す。優位性検証の層別
+    と、EA の環境判別（非整序日は壁をレンジ境界として使う確信度を下げる）に使う。
+
+    Returns:
+        "inside"      : P <= Z <= C（整序。4区分がそのまま使える）
+        "above_call"  : Z > C（非整序。ネガγ寄りで直上にレジ）
+        "below_put"   : Z < P（非整序。ポジγ寄りで直下にサポート）
+        None          : C/P/Z のいずれかが None（= data_error。判定不能）
+    """
+    if call_wall is None or put_wall is None or zero_gamma is None:
+        return None
+    if zero_gamma > call_wall:
+        return "above_call"
+    if zero_gamma < put_wall:
+        return "below_put"
+    return "inside"
 
 
 # ──────────────────────────────────────────────────────────
