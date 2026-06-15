@@ -7548,15 +7548,15 @@
     "data_quality": "ok",
     "call_wall": 750.0,
     "put_wall": 730.0,
-    "zero_gamma": 745.06,
+    "zero_gamma": 745.04,
     "max_pain": 725.0,
     "underlying_price": 741.75,
     "z_position": "inside",
-    "total_gex": -2357648752,
-    "timestamp": "2026-06-13T12:45:18Z",
-    "data_source": "rest_backfill_v2",
+    "total_gex": -2347084266,
+    "timestamp": "2026-06-15T23:25:48Z",
+    "data_source": "rest",
     "symbol": "SPY",
     "as_of": "2026-06-12T00:00:00",
-    "n_contracts_used": 17515722
+    "n_contracts_used": 17510428
   }
 }
