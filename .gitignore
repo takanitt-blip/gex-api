@@ -7,3 +7,6 @@ __pycache__/
 # PC_VALIDATION §2.4: 再配布不可・コミット禁止・CI 非実行・ローカル手動配置
 gex_engine/tests/fixtures/spy_*.csv
 tools/probe_results_*.json
+US500_M15_202406030100_202606122100.csv
+v2a_band_calib_per_session.csv
+v2a_prime_per_session.csv
