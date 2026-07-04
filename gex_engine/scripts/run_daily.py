@@ -167,11 +167,25 @@ def run() -> None:
         logger.info("Fetched %d rows", len(df))
 
         if df.empty:
-            # NO_DATA（休場日等）。ジョブとしては成功扱いで終わる。
-            # 当日分のエントリは作成しない（既存履歴は壊さない）。
-            logger.warning(
-                "Empty option chain (likely market holiday or NO_DATA). "
-                "Skipping write. gex_history.json is unchanged."
+            # 監査20（2026-07-04 改修）: 以前はここで「たぶん休場日」と
+            # 決め打ちしていたが、Adapter が渡す trade_date は
+            # calendar/on_date で既に営業日と確認済みのため、この分岐に
+            # 来る時点で休場日という説明は成立しない。原因の切り分け
+            # （EMPTY_BOTH / EMPTY_ASYMMETRIC / MERGE_MISMATCH）は
+            # Adapter 側が ERROR ログで既に出しているので、ここでは
+            # それを推測で上書きせず、cron ログを見るよう促すに留める。
+            # ジョブとしては成功扱いで終わる（当日分のエントリは作成
+            # しない＝既存履歴は壊さない）。JSON への異常フラグの反映は
+            # EA 側が data_quality を読む改修（PC_MT5 タスク3）が済むまで
+            # 見送る（obs.L、2026-07-04）。
+            logger.error(
+                "Empty option chain for trade fetch on %s. This is NOT "
+                "expected to be a holiday (trade_date is calendar-"
+                "verified before fetch) -- see the adapter's ERROR log "
+                "above for the specific failure (EMPTY_BOTH / "
+                "EMPTY_ASYMMETRIC / MERGE_MISMATCH). Skipping write. "
+                "gex_history.json is unchanged.",
+                today,
             )
             return
 
