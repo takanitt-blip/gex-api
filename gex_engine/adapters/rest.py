@@ -216,7 +216,13 @@ class ThetaRestAdapter:
 
         Returns:
             統一スキーマ（schema.REQUIRED_DTYPES）に準拠した DataFrame。
-            データなし（休場日等）の場合は schema.empty_dataframe()。
+            データが揃わない場合（監査20）は schema.empty_dataframe()。
+            trade_date は calendar/on_date で {open, early_close} と
+            確認済みの日付のみが渡るため、ここでの空は「休場日」では
+            あり得ない。ThetaData 側の EOD 未生成・API 障害・日付選定
+            バグ等、いずれも要調査の異常として扱う（詳細は
+            _fetch_greeks_eod / _fetch_open_interest 呼び出し直後の
+            分岐コメント参照）。
 
         Raises:
             ThetaPermissionError: 471 PERMISSION
@@ -233,24 +239,52 @@ class ThetaRestAdapter:
             symbol, as_of, trade_date,
         )
 
-        # ── greeks/eod（取引日 T）──
+        # ── greeks/eod と open_interest（取引日 T、同じ日付）──
+        # 監査20: 旧実装は iv_df.empty の時点で即 return し、open_interest を
+        # 一切取得しなかった。これだと「IV は空・OI は非空」という非対称
+        # パターンを構造的に検出できない（OI 側の結果が永久に不明のまま）。
+        # 必ず両方取得してから空判定する。コストは trade_date 取得失敗時に
+        # 限られる追加 HTTP 1 本のみ（正常系は元々両方叩いていた）。
         iv_df = self._fetch_greeks_eod(symbol, trade_date)
-        if iv_df.empty:
-            logger.warning(
-                "greeks/eod returned empty for %s (trade_date=%s). "
-                "Returning empty chain.",
-                symbol, trade_date,
-            )
-            return empty_dataframe()
-
-        # ── open_interest（取引日 T、greeks/eod と同じ日付）──
         oi_df = self._fetch_open_interest(symbol, trade_date)
-        if oi_df.empty:
-            logger.warning(
-                "open_interest returned empty for %s (trade_date=%s). "
-                "Returning empty chain.",
-                symbol, trade_date,
-            )
+
+        iv_empty = iv_df.empty
+        oi_empty = oi_df.empty
+
+        if iv_empty or oi_empty:
+            # trade_date は _resolve_trade_date でカレンダー検証済み
+            # （open/early_close）なので、ここでの空は「休場日」では
+            # あり得ない。symmetric（両方空）でも asymmetric（片方だけ空）
+            # でも要調査の異常として ERROR で顕在化する（監査20）。
+            if iv_empty and oi_empty:
+                logger.error(
+                    "get_option_chain: EMPTY_BOTH for %s trade_date=%s "
+                    "(as_of=%s). Both greeks/eod and open_interest "
+                    "returned no data. trade_date is calendar-verified "
+                    "(open/early_close), so this is NOT a holiday -- "
+                    "likely ThetaData EOD generation delay or API outage.",
+                    symbol, trade_date, as_of,
+                )
+            elif iv_empty:
+                logger.error(
+                    "get_option_chain: EMPTY_ASYMMETRIC (iv_only) for %s "
+                    "trade_date=%s (as_of=%s). greeks/eod is empty but "
+                    "open_interest returned %d row(s). A clean holiday "
+                    "cannot produce this split (both endpoints share the "
+                    "same calendar-verified trade_date) -- likely a date "
+                    "resolution bug or partial API outage.",
+                    symbol, trade_date, as_of, len(oi_df),
+                )
+            else:
+                logger.error(
+                    "get_option_chain: EMPTY_ASYMMETRIC (oi_only) for %s "
+                    "trade_date=%s (as_of=%s). open_interest is empty but "
+                    "greeks/eod returned %d row(s). A clean holiday "
+                    "cannot produce this split (both endpoints share the "
+                    "same calendar-verified trade_date) -- likely a date "
+                    "resolution bug or partial API outage.",
+                    symbol, trade_date, as_of, len(iv_df),
+                )
             return empty_dataframe()
 
         # ── 4 列キーで outer join（片側欠落・Wall 欠落の診断を含む）──
@@ -259,14 +293,15 @@ class ThetaRestAdapter:
         # 監査14: マッチゼロは異常。IV/OI が両方とも非空（上の空チェックを
         # 通過済み）なのに both 行がゼロ = キーが 1 つも一致しなかった。
         # 休場日の空とは別物（expiration 表記の不一致や、片方が古い
-        # データである可能性）。empty を返す挙動自体は休場日と同じだが、
-        # 原因究明できるよう異常として WARNING に明示する。
+        # データである可能性）。監査20 と同じ理由でこれも ERROR に格上げする
+        # （trade_date は休場日ではあり得ないため、空は常に要調査の異常）。
         if merged.empty:
-            logger.warning(
-                "OI/IV merge produced 0 rows for %s (trade_date=%s). "
-                "Both sources had data but no keys matched -- "
-                "possible expiration-format mismatch or stale data.",
-                symbol, trade_date,
+            logger.error(
+                "get_option_chain: MERGE_MISMATCH for %s trade_date=%s "
+                "(as_of=%s). Both sources had data (iv=%d rows, oi=%d "
+                "rows) but no keys matched -- possible expiration-format "
+                "mismatch or stale data.",
+                symbol, trade_date, as_of, len(iv_df), len(oi_df),
             )
             return empty_dataframe()
 

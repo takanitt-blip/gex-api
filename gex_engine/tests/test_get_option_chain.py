@@ -147,25 +147,81 @@ def test_get_option_chain_uses_T_for_both_endpoints(
 # ── 空レスポンス ──
 
 @respx.mock
-def test_get_option_chain_empty_greeks_returns_empty(
+def test_get_option_chain_empty_both_returns_empty(
     adapter: ThetaRestAdapter,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """greeks/eod が空なら空の統一スキーマ DataFrame を返す。"""
+    """greeks/eod・open_interest が両方空（symmetric）なら空の統一スキーマ
+
+    DataFrame を返し、ERROR で EMPTY_BOTH と明示する（監査20）。
+    trade_date はカレンダー検証済みのため「休場日」という語は出ない。
+    """
     _mock_all_open()
     respx.get(GREEKS_EOD_URL).mock(
         return_value=httpx.Response(200, text="")
     )
+    respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text="")
+    )
 
-    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    with caplog.at_level(logging.ERROR):
+        df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
     assert df.empty
     assert set(df.columns) == set(schema.REQUIRED_DTYPES.keys())
+    error_logs = [r for r in caplog.records if "EMPTY_BOTH" in r.message]
+    assert len(error_logs) == 1
+    assert error_logs[0].levelno == logging.ERROR
+    assert "likely market holiday" not in error_logs[0].message.lower()
 
 
 @respx.mock
-def test_get_option_chain_empty_oi_returns_empty(
+def test_get_option_chain_empty_iv_only_fetches_oi_anyway(
     adapter: ThetaRestAdapter,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """open_interest が空なら空の統一スキーマ DataFrame を返す。"""
+    """greeks/eod だけが空（asymmetric, iv_only）でも open_interest は必ず
+
+    取得され、ERROR で EMPTY_ASYMMETRIC (iv_only) と非空側の行数が
+    明示される（監査20）。旧実装は iv_df.empty で即 return し、
+    open_interest を一切叩かなかったため、このケースを構造的に
+    検出できなかった。
+    """
+    _mock_all_open()
+    respx.get(GREEKS_EOD_URL).mock(
+        return_value=httpx.Response(200, text="")
+    )
+    oi_route = respx.get(OI_HISTORY_URL).mock(
+        return_value=httpx.Response(200, text=OI_NORMAL)
+    )
+
+    with caplog.at_level(logging.ERROR):
+        df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
+    # 監査20 の核心: OI は実際に叩かれている（旧実装は叩かなかった）
+    assert oi_route.called
+    assert df.empty
+    error_logs = [
+        r for r in caplog.records
+        if "EMPTY_ASYMMETRIC (iv_only)" in r.message
+    ]
+    assert len(error_logs) == 1
+    assert error_logs[0].levelno == logging.ERROR
+    # OI 側の行数（12 行）が明示されている
+    assert "12 row" in error_logs[0].message
+    assert "likely market holiday" not in error_logs[0].message.lower()
+
+
+@respx.mock
+def test_get_option_chain_empty_oi_only_returns_empty(
+    adapter: ThetaRestAdapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """open_interest だけが空（asymmetric, oi_only）なら空の統一スキーマ
+
+    DataFrame を返し、ERROR で EMPTY_ASYMMETRIC (oi_only) と IV 側の
+    行数が明示される（監査20）。
+    """
     _mock_all_open()
     respx.get(GREEKS_EOD_URL).mock(
         return_value=httpx.Response(200, text=GREEKS_EOD_NORMAL)
@@ -174,8 +230,21 @@ def test_get_option_chain_empty_oi_returns_empty(
         return_value=httpx.Response(200, text="")
     )
 
-    df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+    with caplog.at_level(logging.ERROR):
+        df = adapter.get_option_chain("SPY", date(2026, 5, 14))
+
     assert df.empty
+    error_logs = [
+        r for r in caplog.records
+        if "EMPTY_ASYMMETRIC (oi_only)" in r.message
+    ]
+    assert len(error_logs) == 1
+    assert error_logs[0].levelno == logging.ERROR
+    # IV 側の行数（greeks_eod_normal は 12 行だが、IV 健全性フィルタで
+    # iv_zero 2 + iv_err100 2 = 4 行が落ちるため _fetch_greeks_eod の
+    # 戻り値は 8 行。happy_path テストの前提と同じ）
+    assert "8 row" in error_logs[0].message
+    assert "likely market holiday" not in error_logs[0].message.lower()
 
 
 # ── Step 3b: サイレント Wall 欠落の事実ログ ──
@@ -308,10 +377,13 @@ def test_get_option_chain_zero_match_logs_and_returns_empty(
     adapter: ThetaRestAdapter,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """IV/OI 両方非空だがキーが 1 つも一致しないと WARNING + 空 df。
+    """IV/OI 両方非空だがキーが 1 つも一致しないと ERROR + 空 df。
 
     OI 側の expiration を別の満期に改変し、greeks/eod 側
     （2026-06-18）と一致しないようにする。both 行ゼロ。
+    監査20 に合わせてログレベルを WARNING → ERROR に格上げ（trade_date は
+    カレンダー検証済みで空が休場日ではあり得ない以上、この異常も同じ
+    強度で顕在化させる）。
     """
     _mock_all_open()
     respx.get(GREEKS_EOD_URL).mock(
@@ -323,17 +395,17 @@ def test_get_option_chain_zero_match_logs_and_returns_empty(
         return_value=httpx.Response(200, text=oi_mismatched)
     )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.ERROR):
         df = adapter.get_option_chain("SPY", date(2026, 5, 14))
 
     assert df.empty
     assert set(df.columns) == set(schema.REQUIRED_DTYPES.keys())
     zero_match_logs = [
         r for r in caplog.records
-        if "no keys matched" in r.message
+        if "MERGE_MISMATCH" in r.message
     ]
     assert len(zero_match_logs) == 1
-    assert zero_match_logs[0].levelno == logging.WARNING
+    assert zero_match_logs[0].levelno == logging.ERROR
 
 
 # ── 誤判断25: trade_date 列の契約 ──
