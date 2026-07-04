@@ -1,0 +1,141 @@
+name: Probe EOD Availability (OI boundary measurement)
+
+# ─────────────────────────────────────────────────────────────
+# 【位置づけ】PC_GOVERNANCE 誤判断36 対応・診断専用ワークフロー
+# 【期間限定運用】最低 5 営業日分のサンプルが溜まったら、この workflow
+#   自体（本ファイル）を削除するか schedule トリガーだけ外すこと。
+#   恒久的な第二の定期ジョブとしてリポジトリに残すのは、このプロジェクトの
+#   方針（probe/tools は CI 非実行・使い捨て診断、PC_GOVERNANCE 誤判断29系）
+#   に反する。四半期に1回など再検証が必要になった時だけ workflow_dispatch
+#   で手動起動すれば十分。
+#
+# 【自動化について（schedule 採用の是非）】
+# schedule トリガーで自動化する。ただし GitHub Actions の cron は
+# 最大 13 時間規模でジッターしうることが実測済み（PC_PIPELINE §1.5、
+# update_gex.yml 内コメント参照）。本ワークフローの対象時間帯
+# (UTC 10:00-13:25 = ET 06:00-09:25 夏時間) は production が踏んだ
+# 混雑帯 (UTC 22:00-00:30) とは異なるため同規模のジッターは起きにくいと
+# 推測されるが、断定はできない。そのため、実行開始が遅れて観測の
+# 立ち上がりを取り逃した場合に備え、tools/probe_eod_availability.py 側で
+# 「初回ポーリングから既に非ゼロ行」を検出した際に警告ノートを記録する
+# ようにしてある（左側打ち切りの明示。閾値のごまかしではなく、
+# 観測の限界を隠さず記録する設計）。分析時は必ずこのフラグを確認すること。
+#
+# 【DST に関する注意】
+# cron 時刻 09:45 UTC は「ET 05:45 (夏時間 EDT, UTC-4)」を意図している。
+# 冬時間 (EST, UTC-5) になると同じ UTC 時刻は ET 04:45 相当にズレる
+# (30分早すぎても実害はないが、確認はすること)。本診断は短期の測定
+# フェーズで終える想定のため、このワークフローが冬時間を跨いで残る
+# 場合は cron 値を再確認すること。
+#
+# 【Theta Terminal 起動手順について】
+# 以下の起動〜ヘルスチェックのブロックは update_gex.yml (production) から
+# そのまま踏襲している。ただし production のヘルスチェックが固定の
+# 過去満期 (expiration=2026-06-18) を使っており、これは 2026-07-04 現在
+# 既に満期を過ぎている（要検証のまま放置されている状態、production 側は
+# 別途確認が必要）。同じ轍を踏まないよう、本ワークフローのヘルスチェックは
+# 「実行日の 30 日前」を毎回動的に計算し、expiration=* で叩く形に変更した。
+# 固定の日付・満期を焼き込まないことで、時間が経っても腐らない。
+
+on:
+  schedule:
+    - cron: '45 9 * * 1-5'   # UTC 09:45 = ET 05:45 (EDT, 夏時間)
+  workflow_dispatch: {}
+
+permissions:
+  contents: read   # gex_history.json 等への書き込みはしない（読み取りのみで十分）
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # ET 05:45-09:25 (3時間40分) + Terminal起動・セットアップの余裕
+    timeout-minutes: 260
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install httpx
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      # ───── Theta Terminal セットアップ（update_gex.yml から踏襲） ─────
+      - name: Download Theta Terminal v3 jar (from official URL)
+        run: |
+          curl -L -o ThetaTerminalv3.jar https://download-unstable.thetadata.us/ThetaTerminalv3.jar
+          ls -lh ThetaTerminalv3.jar
+
+      - name: Configure creds.txt
+        run: |
+          printf '%s\n' "${{ secrets.THETA_CREDS }}" > creds.txt
+          wc -l creds.txt
+
+      - name: Start Theta Terminal in background
+        run: |
+          nohup java -jar ThetaTerminalv3.jar --creds-file creds.txt > theta_terminal.log 2>&1 &
+          echo "Started Theta Terminal with PID $!"
+          echo "$!" > theta_terminal.pid
+
+      - name: Wait for Theta Terminal health check
+        # update_gex.yml と同じ「本番が実際に叩くエンドポイントで
+        # 疎通確認する」原則（誤判断16）は踏襲しつつ、固定満期の
+        # 腐敗（本文コメント参照）を避けるため日付を動的計算する。
+        run: |
+          set +e
+          HEALTHCHECK_DATE=$(date -u -d '30 days ago' +%Y%m%d)
+          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=*&start_date=${HEALTHCHECK_DATE}&end_date=${HEALTHCHECK_DATE}&format=csv"
+          echo "Health check date (30 days ago, UTC): ${HEALTHCHECK_DATE}"
+          for i in $(seq 1 60); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
+            if [ "$status" = "200" ]; then
+              echo "Theta Terminal is ready (took ${i} seconds)"
+              exit 0
+            fi
+            echo "Attempt ${i}/60: HTTP $status, waiting..."
+            sleep 1
+          done
+          echo "❌ Theta Terminal did not become ready within 60 seconds"
+          echo "── theta_terminal.log (last 50 lines) ──"
+          tail -50 theta_terminal.log || true
+          exit 1
+
+      - name: Show Theta Terminal startup log (for confirmation)
+        run: |
+          echo "── theta_terminal.log (head 30 lines) ──"
+          head -30 theta_terminal.log
+
+      # ───── probe 本体 ─────
+      - name: Run OI availability probe
+        run: |
+          python tools/probe_eod_availability.py \
+            --symbol SPY \
+            --output-dir probe_results
+        # 未収束(rc=1)でもログを必ず artifact に残したいので、
+        # このステップの失敗だけでジョブ全体を止めない。
+        continue-on-error: true
+
+      - name: Upload probe results (metadata only, no subscription data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oi-boundary-probe-${{ github.run_id }}
+          path: probe_results/
+          retention-days: 90
+
+      - name: Stop Theta Terminal
+        if: always()
+        run: |
+          if [ -f theta_terminal.pid ]; then
+            pid=$(cat theta_terminal.pid)
+            kill "$pid" 2>/dev/null || true
+            echo "Stopped Theta Terminal (PID $pid)"
+          fi
