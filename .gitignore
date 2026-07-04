@@ -10,3 +10,6 @@ tools/probe_results_*.json
 US500_M15_202406030100_202606122100.csv
 v2a_band_calib_per_session.csv
 v2a_prime_per_session.csv
+
+# probe_eod_availability.py のローカル実行結果（Actions artifact に保存、リポジトリには含めない）
+probe_results/
