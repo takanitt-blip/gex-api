@@ -30,12 +30,19 @@ name: Probe EOD Availability (OI boundary measurement)
 #
 # 【Theta Terminal 起動手順について】
 # 以下の起動〜ヘルスチェックのブロックは update_gex.yml (production) から
-# そのまま踏襲している。ただし production のヘルスチェックが固定の
-# 過去満期 (expiration=2026-06-18) を使っており、これは 2026-07-04 現在
-# 既に満期を過ぎている（要検証のまま放置されている状態、production 側は
-# 別途確認が必要）。同じ轍を踏まないよう、本ワークフローのヘルスチェックは
-# 「実行日の 30 日前」を毎回動的に計算し、expiration=* で叩く形に変更した。
-# 固定の日付・満期を焼き込まないことで、時間が経っても腐らない。
+# そのまま踏襲している。ヘルスチェックの日付/満期は、production と同様に
+# 固定値（十分に古く backfill 範囲内で確実に取引日であることを確認済みの
+# ペア）を使う。
+#
+# ※ 当初「実行日のN日前を動的計算する」方式を採用したが、これは
+#   「固定の過去日は時間経過で陳腐化する」という誤った懸念に基づくもので、
+#   かつ市場カレンダー（土日祝）を考慮しない bash date 演算だったため、
+#   2026-07-06 の実行で実際にヘルスチェックが失敗した（30日前が偶然
+#   土曜日に当たり、常に 472=NO_DATA を返し続けた）。history API に
+#   とって過去の確定日は未来がどれだけ進んでも変わらない固定点であり、
+#   固定日付自体は陳腐化しない（production の固定満期 2026-06-18 が
+#   満期経過後も問題なく動作し続けていることで実証済み）。この誤解に
+#   基づく「動的化」は撤回し、production と同じ固定値方式に戻した。
 
 on:
   schedule:
@@ -87,13 +94,38 @@ jobs:
 
       - name: Wait for Theta Terminal health check
         # update_gex.yml と同じ「本番が実際に叩くエンドポイントで
-        # 疎通確認する」原則（誤判断16）は踏襲しつつ、固定満期の
-        # 腐敗（本文コメント参照）を避けるため日付を動的計算する。
+        # 疎通確認する」原則（誤判断16）を踏襲。
+        #
+        # ⚠️ 2026-07-06 運用インシデントを受けた修正:
+        #   当初「実行日の30日前」を動的計算する方式にしていたが、
+        #   これは市場カレンダーを一切考慮しない bash の date 演算で、
+        #   30日前が土日祝に当たると常に 472(NO_DATA) を返し続け、
+        #   ヘルスチェックが60秒でタイムアウトして失敗した
+        #   （2026-07-06 の実行で実際に発生。30日前=2026-06-06=土曜）。
+        #
+        #   そもそも「固定の過去日付は時間経過で陳腐化する」という
+        #   当初の懸念自体が誤りだった。history API にとって過去の
+        #   確定した1日は未来がどれだけ進んでも変わらない固定点であり、
+        #   陳腐化しない。production の update_gex.yml が固定日付・
+        #   固定満期(expiration=2026-06-18, date=20260512)を使い続けて
+        #   何の問題も起きていない（gex_history.json 07/01〜07/06で
+        #   満期後も正常動作を確認済み）のは、まさにこの理由による。
+        #
+        #   よって「動的化」自体を撤回し、production と同じ設計思想
+        #   （固定の過去日 + 固定の満期、十分に古く backfill 範囲内で
+        #    確実に取引日であることを事前に人間が確認したペア）に戻す。
+        #   bash に曜日/祝日判定を継ぎ足すことはしない
+        #   （calendar/on_date という正解を持つ公式APIがあるのに、
+        #    それを呼ばず簡易版を自前実装してエッジケースの穴を踏む、
+        #    という同じ過ちを繰り返すだけのため）。
+        #
+        #   採用date/expiration: 2024-01-03（水曜、NYSE通常取引日、
+        #   backfill floor 2017-01-03 より十分新しく安定）/
+        #   expiration=2024-01-19（同年1月の通常満期、2024-01-03時点で
+        #   既に上場・取引されていたことが確実な近接満期）。
         run: |
           set +e
-          HEALTHCHECK_DATE=$(date -u -d '30 days ago' +%Y%m%d)
-          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=*&start_date=${HEALTHCHECK_DATE}&end_date=${HEALTHCHECK_DATE}&format=csv"
-          echo "Health check date (30 days ago, UTC): ${HEALTHCHECK_DATE}"
+          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=2024-01-19&start_date=20240103&end_date=20240103&format=csv"
           for i in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
             if [ "$status" = "200" ]; then
