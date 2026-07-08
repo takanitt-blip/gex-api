@@ -351,7 +351,22 @@ def main() -> int:
     parser.add_argument("--output-dir", default="probe_results", type=Path)
     args = parser.parse_args()
 
-    return run_probe(args.symbol, args.base_url, args.output_dir)
+    try:
+        return run_probe(args.symbol, args.base_url, args.output_dir)
+    except Exception:
+        # rc=1(未収束、想定内)と rc=2(予期しない例外、実装バグ)を区別する。
+        # workflow 側は rc=2 だけを「本物の失敗」として扱う設計
+        # （2026-07-08 のインシデント: continue-on-error が両者を区別
+        #   できず、クラッシュを「成功」として見せてしまっていたため）。
+        import traceback
+
+        traceback.print_exc()
+        print(
+            "FATAL: probe が予期しない例外で異常終了した(rc=2)。"
+            "これは「未収束」とは異なり、実装のバグの可能性が高い。",
+            file=sys.stderr,
+        )
+        return 2
 
 
 if __name__ == "__main__":
