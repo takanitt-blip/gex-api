@@ -148,12 +148,27 @@ def _get_with_retry(
 
 
 def fetch_calendar_type(client: httpx.Client, base_url: str, d: date) -> str:
-    resp, _ = _get_with_retry(client, f"{base_url}/calendar/on_date", {"date": fmt_date(d)})
+    """
+    calendar/on_date の実際の応答仕様（公式APIリファレンス確認済み、2026-07-08）:
+    - format パラメータ省略時のデフォルトは CSV（JSONではない）。
+    - JSON指定時でも応答は単一オブジェクトではなく「配列」
+      （array of {type, open, close}）。
+    ここでは他エンドポイント（open_interest, greeks/eod）と同じくCSVで統一し、
+    ヘッダ行を除いた最初のデータ行から type 列を取り出す。
+    """
+    resp, _ = _get_with_retry(
+        client, f"{base_url}/calendar/on_date", {"date": fmt_date(d), "format": "csv"}
+    )
     if resp is None:
         raise RuntimeError(f"calendar/on_date({d}) が通信エラーで取得できなかった")
     if resp.status_code == NO_DATA_CODE:
         raise RuntimeError(f"calendar/on_date({d}) で NO_DATA は想定外の応答")
-    return resp.json()["type"]
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    if not rows:
+        raise RuntimeError(
+            f"calendar/on_date({d}) の応答が空で type を取得できない: {resp.text[:200]!r}"
+        )
+    return rows[0]["type"]
 
 
 def resolve_previous_trading_day(client: httpx.Client, base_url: str, as_of: date) -> date:
@@ -231,6 +246,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     "expiration": "*",
                     "start_date": fmt_date(trade_date),
                     "end_date": fmt_date(trade_date),
+                    "format": "csv",
                 },
             )
             _append_record(
@@ -267,7 +283,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
             status, row_count, elapsed_ms = fetch_row_count(
                 client,
                 f"{base_url}/option/history/open_interest",
-                {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date)},
+                {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date), "format": "csv"},
             )
             note = "" if status != -1 else "通信欠測（リトライ上限到達）。この回は欠測扱い。"
 
