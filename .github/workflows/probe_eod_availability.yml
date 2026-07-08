@@ -147,13 +147,25 @@ jobs:
 
       # ───── probe 本体 ─────
       - name: Run OI availability probe
+        id: probe
+        env:
+          PYTHONUNBUFFERED: "1"
+        # rc=0(成功)・rc=1(未収束、想定内)は step 成功のまま進める。
+        # rc=2(予期しない例外・実装バグ)だけを本物の失敗として扱う
+        # （2026-07-08: continue-on-error が両者を区別できず、
+        #   calendar/on_date のクラッシュを「成功」に見せていたインシデントの是正）。
         run: |
+          set +e
           python tools/probe_eod_availability.py \
             --symbol SPY \
             --output-dir probe_results
-        # 未収束(rc=1)でもログを必ず artifact に残したいので、
-        # このステップの失敗だけでジョブ全体を止めない。
-        continue-on-error: true
+          rc=$?
+          echo "probe exited with code ${rc}"
+          if [ "$rc" = "2" ]; then
+            echo "::error::probe が異常終了(rc=2)。想定内の「未収束」ではなく実装のバグの可能性が高い。ログを確認すること。"
+            exit 1
+          fi
+          exit 0
 
       - name: Upload probe results (metadata only, no subscription data)
         if: always()
