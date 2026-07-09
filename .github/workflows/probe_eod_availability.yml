@@ -55,8 +55,17 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    # ET 05:45-09:25 (3時間40分) + Terminal起動・セットアップの余裕
-    timeout-minutes: 260
+    # GitHub Actions ホスト型ランナーの1ジョブあたりハード上限(6時間=360分)
+    # に収まる範囲で、できるだけ長く確保する。深夜(ET 00:00頃)からの
+    # 早期起動テストにも対応するための余裕（2026-07-09、境界探索を
+    # 前倒しする運用に合わせて 260→355 に変更）。
+    # 実測(2026-07-07分)では ET 05:37 時点で既にOIが揃っていたため、
+    # 00:00起点でも6時間以内(=06:00まで)に収束する可能性が高いと
+    # 推測されるが、断定はできない。09:25 の cutoff より先に
+    # プラットフォーム上限で強制終了された場合でも、それまでに
+    # 記録済みの probe_results/*.jsonl は artifact としてアップロード
+    # される（if: always() のため）ので、部分的なデータは失われない。
+    timeout-minutes: 355
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
