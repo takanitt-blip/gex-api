@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import sys
@@ -86,6 +87,7 @@ class PollRecord:
     http_status: int
     row_count: int
     elapsed_ms: int
+    content_hash: str = ""
     note: str = ""
 
 
@@ -190,16 +192,26 @@ def count_csv_rows(text: str) -> int:
     return max(0, len(rows) - 1) if rows else 0
 
 
+def compute_content_hash(text: str) -> str:
+    """
+    レスポンス本文全体のハッシュ（先頭16文字に短縮）。
+    行数が同じでも中身(各行のOI値)が変わっていないかを検出するための
+    独立したシグナル。個人購読データそのものはログに残さず、
+    ハッシュ値だけを記録する。
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def fetch_row_count(
     client: httpx.Client, url: str, params: dict
-) -> tuple[int, int, int]:
-    """戻り値: (http_status, row_count, elapsed_ms)。通信欠測時は (-1, -1, 0)。"""
+) -> tuple[int, int, int, str]:
+    """戻り値: (http_status, row_count, elapsed_ms, content_hash)。通信欠測時は (-1, -1, 0, "")。"""
     resp, elapsed_ms = _get_with_retry(client, url, params)
     if resp is None:
-        return -1, -1, 0
+        return -1, -1, 0, ""
     if resp.status_code == NO_DATA_CODE:
-        return resp.status_code, 0, elapsed_ms
-    return resp.status_code, count_csv_rows(resp.text), elapsed_ms
+        return resp.status_code, 0, elapsed_ms, ""
+    return resp.status_code, count_csv_rows(resp.text), elapsed_ms, compute_content_hash(resp.text)
 
 
 def interval_seconds_for(now: datetime) -> int:
@@ -238,7 +250,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
         # 常に成功する想定。ここで失敗する場合は「境界」ではなく前夜の
         # 生成自体が失敗した別障害として扱う。
         try:
-            g_status, g_rows, g_ms = fetch_row_count(
+            g_status, g_rows, g_ms, g_hash = fetch_row_count(
                 client,
                 f"{base_url}/option/history/greeks/eod",
                 {
@@ -259,6 +271,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     http_status=g_status,
                     row_count=g_rows,
                     elapsed_ms=g_ms,
+                    content_hash=g_hash,
                     note="前日夜間生成分の健全性チェック。境界計測の対象外。",
                 ),
             )
@@ -274,13 +287,14 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
         # --- 本題: open_interest の境界を実測するループ ---
         cutoff = datetime.combine(today_et, _CUTOFF_0925, tzinfo=ET)
         prev_row_count: int | None = None
+        prev_content_hash: str | None = None
         stable_count = 0
         converged = False
         first_poll = True
 
         while now_et() < cutoff:
             t_now = now_et()
-            status, row_count, elapsed_ms = fetch_row_count(
+            status, row_count, elapsed_ms, content_hash = fetch_row_count(
                 client,
                 f"{base_url}/option/history/open_interest",
                 {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date), "format": "csv"},
@@ -311,18 +325,28 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     http_status=status,
                     row_count=row_count,
                     elapsed_ms=elapsed_ms,
+                    content_hash=content_hash,
                     note=note,
                 ),
             )
-            print(f"[{t_now.strftime('%H:%M:%S %Z')}] status={status} rows={row_count} {note}")
+            print(f"[{t_now.strftime('%H:%M:%S %Z')}] status={status} rows={row_count} hash={content_hash} {note}")
 
-            if row_count > 0 and row_count == prev_row_count:
+            # 収束判定: 行数だけでなく content_hash も2回連続で一致することを
+            # 要求する。行数が同じでも中身(各行のOI値)が訂正されている
+            # ケースを、行数だけの判定では見逃すため（2026-07-XX 追加）。
+            is_stable_match = (
+                row_count > 0
+                and row_count == prev_row_count
+                and content_hash
+                and content_hash == prev_content_hash
+            )
+            if is_stable_match:
                 stable_count += 1
                 if stable_count >= 2:
                     converged = True
                     print(
-                        f"収束: {t_now.strftime('%H:%M:%S %Z')} 時点で行数 {row_count} が"
-                        f"2回連続一致。T={trade_date} の OI 境界とみなす。"
+                        f"収束: {t_now.strftime('%H:%M:%S %Z')} 時点で行数 {row_count} と"
+                        f"content_hash が2回連続一致。T={trade_date} の OI 境界とみなす。"
                     )
                     break
             else:
@@ -330,6 +354,8 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
 
             if row_count >= 0:
                 prev_row_count = row_count
+            if content_hash:
+                prev_content_hash = content_hash
 
             time.sleep(interval_seconds_for(now_et()))
 
