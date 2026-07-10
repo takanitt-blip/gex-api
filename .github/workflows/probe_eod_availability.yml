@@ -47,7 +47,15 @@ name: Probe EOD Availability (OI boundary measurement)
 on:
   schedule:
     - cron: '45 9 * * 1-5'   # UTC 09:45 = ET 05:45 (EDT, 夏時間)
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      trade_date:
+        description: >-
+          対象取引日を明示指定 (YYYY-MM-DD、省略可)。週末を挟む金曜分を
+          土曜日に観測する場合など、「今日」自体が取引日でない日に手動起動
+          する際に指定する。空欄なら従来通り「実行日の前営業日」を自動解決する。
+        required: false
+        type: string
 
 permissions:
   contents: read   # gex_history.json 等への書き込みはしない（読み取りのみで十分）
@@ -165,9 +173,12 @@ jobs:
         #   calendar/on_date のクラッシュを「成功」に見せていたインシデントの是正）。
         run: |
           set +e
-          python tools/probe_eod_availability.py \
-            --symbol SPY \
-            --output-dir probe_results
+          ARGS="--symbol SPY --output-dir probe_results"
+          if [ -n "${{ inputs.trade_date }}" ]; then
+            ARGS="$ARGS --trade-date ${{ inputs.trade_date }}"
+            echo "対象取引日を明示指定: ${{ inputs.trade_date }}"
+          fi
+          python tools/probe_eod_availability.py $ARGS
           rc=$?
           echo "probe exited with code ${rc}"
           if [ "$rc" = "2" ]; then
