@@ -229,18 +229,34 @@ def _append_record(out_path: Path, rec: PollRecord) -> None:
         f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
 
 
-def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
+def run_probe(
+    symbol: str, base_url: str, output_dir: Path, trade_date_override: date | None = None
+) -> int:
     with httpx.Client() as client:
-        today_et = now_et().date()
+        if trade_date_override is not None:
+            # 明示指定モード: 「今日が取引日か」のゲートは適用しない。
+            # 週末を挟む金曜分などを、土曜日(非取引日)に起動して狙う場合に使う。
+            # 指定日自体が取引日だったかだけは確認する(誤指定の早期検出)。
+            override_type = fetch_calendar_type(client, base_url, trade_date_override)
+            if override_type not in TRADING_DAY_TYPES:
+                print(
+                    f"--trade-date で指定された {trade_date_override} は取引日ではない "
+                    f"(type={override_type})。指定を確認すること。"
+                )
+                return 0
+            trade_date = trade_date_override
+            print(f"probe 対象 T = {trade_date}（--trade-date で明示指定）")
+        else:
+            today_et = now_et().date()
 
-        # 前提チェック: 今日自体が取引日でなければ probe を実行せず即終了
-        today_type = fetch_calendar_type(client, base_url, today_et)
-        if today_type not in TRADING_DAY_TYPES:
-            print(f"{today_et} は取引日ではない (type={today_type})。probe を実行せず終了。")
-            return 0
+            # 前提チェック: 今日自体が取引日でなければ probe を実行せず即終了
+            today_type = fetch_calendar_type(client, base_url, today_et)
+            if today_type not in TRADING_DAY_TYPES:
+                print(f"{today_et} は取引日ではない (type={today_type})。probe を実行せず終了。")
+                return 0
 
-        trade_date = resolve_previous_trading_day(client, base_url, today_et)
-        print(f"probe 対象 T = {trade_date}（今日 {today_et} の前営業日）")
+            trade_date = resolve_previous_trading_day(client, base_url, today_et)
+            print(f"probe 対象 T = {trade_date}（今日 {today_et} の前営業日）")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / f"oi_boundary_{trade_date.isoformat()}.jsonl"
@@ -285,7 +301,11 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
             print(f"警告: greeks/eod 健全性チェックで例外: {exc}。OI probe は続行する。")
 
         # --- 本題: open_interest の境界を実測するループ ---
-        cutoff = datetime.combine(today_et, _CUTOFF_0925, tzinfo=ET)
+        # cutoff は「T がいつか」に関わらず、常に「今実行している暦日の09:25 ET」。
+        # --trade-date 明示指定モード(土曜起動など)でも、実行している暦日自体は
+        # 土曜のままなので、その日の09:25が締切になる(通常モードと同じ理屈)。
+        run_date = now_et().date()
+        cutoff = datetime.combine(run_date, _CUTOFF_0925, tzinfo=ET)
         prev_row_count: int | None = None
         prev_content_hash: str | None = None
         stable_count = 0
@@ -375,10 +395,32 @@ def main() -> int:
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--base-url", default="http://127.0.0.1:25503/v3")
     parser.add_argument("--output-dir", default="probe_results", type=Path)
+    parser.add_argument(
+        "--trade-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "対象取引日を明示指定する。省略時は実行日の前営業日を自動解決する"
+            "(平日朝の通常運用)。週末を挟む金曜分を土曜日に観測する場合など、"
+            "「今日」自体が取引日でない日に起動する際に使う。"
+        ),
+    )
     args = parser.parse_args()
 
+    trade_date_override = None
+    if args.trade_date:
+        try:
+            trade_date_override = datetime.strptime(args.trade_date, "%Y-%m-%d").date()
+        except ValueError:
+            print(
+                f"FATAL: --trade-date の形式が不正: {args.trade_date!r} "
+                f"(YYYY-MM-DD 形式で指定すること)",
+                file=sys.stderr,
+            )
+            return 2
+
     try:
-        return run_probe(args.symbol, args.base_url, args.output_dir)
+        return run_probe(args.symbol, args.base_url, args.output_dir, trade_date_override)
     except Exception:
         # rc=1(未収束、想定内)と rc=2(予期しない例外、実装バグ)を区別する。
         # workflow 側は rc=2 だけを「本物の失敗」として扱う設計
