@@ -33,6 +33,19 @@
 //|   動作する。data_quality フィールドそのものの読み込み・4状態判別    |
 //|   との連動（PC_MT5 EA改修タスク3/4）は依然未実装で、別途対応する。  |
 //|                                                                    |
+//|  【v1.22 変更点（Step 1D、座標変換の根治）】                        |
+//|   固定 InpScaleFactor(=10.0) による SPY→US500 換算を廃止し、        |
+//|   wall_coords.py（Python側）と同一の設計思想＝「日次リアンカー」を  |
+//|   EA 自身のチャート履歴から動的に算出する GetDailyRatio() に置換。  |
+//|   ratio_d = US500の当日(ET16:00引け)終値 / SPYの同日EOD終値         |
+//|   （JSON の underlying_price）。固定10倍は「窓内でドリフトし        |
+//|   不正確」と Python 側検証で既に確定済みの前提であり、EA だけが     |
+//|   それに反する固定値を使い続けていた食い違いを解消する。            |
+//|   チャート履歴が不足し取得できない日のみ、InpScaleFactor を         |
+//|   非常時フォールバックとして使用し、ラベルに [approx] を付記して    |
+//|   区別できるようにした（v1.21のDrawIncompleteWarning警告系統とは    |
+//|   独立の、別種の不完全性シグナルとして扱う）。                      |
+//|                                                                    |
 //|  【既知の相違点（要ユーザー確認）】                                |
 //|   PC_MT5.md は「Max Pain(マゼンタ,破線)描画を2026-06-20 (v1.10)   |
 //|   で実装完了」と記録しているが、本ファイルの実物（v1.00ベース）    |
@@ -47,7 +60,7 @@
 //|   ・トレード判断                                                   |
 //+------------------------------------------------------------------+
 #property copyright "GEX Environment Detection Engine"
-#property version   "1.21"
+#property version   "1.22"
 #property strict
 
 //================================================================
@@ -60,7 +73,9 @@ input string InpHistoryUrl = "https://raw.githubusercontent.com/takanitt-blip/ge
 // 更新間隔（時間）
 input int InpUpdateHours = 1;
 
-// SPY → US500 換算比率
+// SPY → US500 換算比率（非常時フォールバックのみ。通常は GetDailyRatio() が
+// チャート履歴から日次で動的算出する。固定10倍は窓内でドリフトするため、
+// これを主経路として使うことは不可 ── wall_coords.py の検証結論と同一）
 input double InpScaleFactor = 10.0;
 
 // 表示する履歴日数
@@ -270,6 +285,41 @@ datetime GetGovernStartServerTime(string json, string dateKey)
 
 
 //================================================================
+// Step 1D: SPY → US500 日次リアンカー・レシオ
+//
+// wall_coords.py（Python側検証）と同一の定義:
+//   ratio_d = US500の当日EOD(ET 16:00引け相当) / SPYの同日EOD(underlying_price)
+// 固定 InpScaleFactor は「窓内でドリフトし不正確」と既に検証で確定済みの
+// ため使わない。EA 自身のチャート履歴（このEAが動いている US500 系
+// シンボル）から、JSON の as_of 日の引け値を直接引いて算出する。
+//
+// 取得失敗（履歴不足・当該バー欠落）時は 0.0 を返し、呼び出し側が
+// InpScaleFactor へフォールバックする。
+//================================================================
+double GetDailyRatio(string json, string dateKey)
+{
+    double spyEod = GetValueFromJson(json, dateKey, "underlying_price");
+    if(spyEod <= 0) return 0.0;
+
+    string asOfStr = GetAsOfDateStr(json, dateKey);
+    if(asOfStr == "") return 0.0;
+
+    // as_of(T) 当日の ET16:00（現物市場の引け＝ underlying_price が
+    // 参照している瞬間）に対応するサーバー時刻を算出
+    datetime utcCloseET   = ETDateStrToUTC(asOfStr) + 16 * 3600;
+    datetime serverCloseT = UTCToServerTime(utcCloseET);
+
+    int shift = iBarShift(_Symbol, PERIOD_CURRENT, serverCloseT, false);
+    if(shift < 0) return 0.0;
+
+    double us500Eod = iClose(_Symbol, PERIOD_CURRENT, shift);
+    if(us500Eod <= 0) return 0.0;
+
+    return us500Eod / spyEod;
+}
+
+
+//================================================================
 // JSON をパースして全日付を描画
 //================================================================
 int ParseAndDraw(string json)
@@ -337,7 +387,18 @@ int ParseAndDraw(string json)
             }
         }
 
-        if(DrawOneDay(json, dateKey, isLatest, segStart, segEnd)) {
+        // Step 1D: 固定InpScaleFactorではなく、その日のリアンカー・レシオを使う
+        double ratio = GetDailyRatio(json, dateKey);
+        bool   ratioFallback = false;
+        if(ratio <= 0.0) {
+            ratio = InpScaleFactor;
+            ratioFallback = true;
+            Print("[GEX Visualizer] 警告: ", dateKey,
+                  " の動的レシオ取得失敗（チャート履歴不足の可能性）。"
+                  "固定値(", DoubleToString(InpScaleFactor, 2), ")にフォールバック");
+        }
+
+        if(DrawOneDay(json, dateKey, isLatest, segStart, segEnd, ratio, ratioFallback)) {
             drawn++;
         } else {
             // DrawOneDay 内の call/put/zero <= 0 ガードでスキップされたケース
@@ -448,10 +509,12 @@ int CollectDates(string json, string &dates[])
 
 //================================================================
 // 1 日分のデータを描画（Step 1C: t1/t2 は呼び出し側=ParseAndDraw が
-// as_of 基準で算出済みのものを渡す）
+// as_of 基準で算出済みのものを渡す。Step 1D: ratio も同様に呼び出し側で
+// 日次リアンカー算出済みのものを受け取る）
 //================================================================
 bool DrawOneDay(string json, string dateKey, bool isLatest,
-                 datetime t1, datetime t2)
+                 datetime t1, datetime t2,
+                 double ratio, bool ratioFallback)
 {
     double call = GetValueFromJson(json, dateKey, "call_wall");
     double put  = GetValueFromJson(json, dateKey, "put_wall");
@@ -467,15 +530,16 @@ bool DrawOneDay(string json, string dateKey, bool isLatest,
     ENUM_LINE_STYLE solidStyle = isLatest ? STYLE_SOLID : STYLE_DOT;
     ENUM_LINE_STYLE dashStyle  = isLatest ? STYLE_DASH  : STYLE_DOT;
     
-    // 価格を US500 スケールに変換
-    double callPrice = call * InpScaleFactor;
-    double putPrice  = put  * InpScaleFactor;
-    double zeroPrice = zero * InpScaleFactor;
+    // 価格を US500 スケールに変換（Step 1D: 日次リアンカー済みのratioを使用）
+    double callPrice = call * ratio;
+    double putPrice  = put  * ratio;
+    double zeroPrice = zero * ratio;
     
-    // ラベル（最新日のみ）
-    string callLabel = isLatest ? StringFormat("Call %.1f", callPrice) : "";
-    string putLabel  = isLatest ? StringFormat("Put %.1f",  putPrice)  : "";
-    string zeroLabel = isLatest ? StringFormat("Zero %.1f", zeroPrice) : "";
+    // ラベル（最新日のみ。フォールバック時は近似値である旨を明示）
+    string suffix    = ratioFallback ? " [approx]" : "";
+    string callLabel = isLatest ? StringFormat("Call %.1f%s", callPrice, suffix) : "";
+    string putLabel  = isLatest ? StringFormat("Put %.1f%s",  putPrice,  suffix) : "";
+    string zeroLabel = isLatest ? StringFormat("Zero %.1f%s", zeroPrice, suffix) : "";
     
     DrawTrendLine(OBJ_PREFIX + "C_" + dateKey,
                   t1, callPrice, t2, callPrice,
