@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import sys
@@ -86,6 +87,7 @@ class PollRecord:
     http_status: int
     row_count: int
     elapsed_ms: int
+    content_hash: str = ""
     note: str = ""
 
 
@@ -148,12 +150,27 @@ def _get_with_retry(
 
 
 def fetch_calendar_type(client: httpx.Client, base_url: str, d: date) -> str:
-    resp, _ = _get_with_retry(client, f"{base_url}/calendar/on_date", {"date": fmt_date(d)})
+    """
+    calendar/on_date の実際の応答仕様（公式APIリファレンス確認済み、2026-07-08）:
+    - format パラメータ省略時のデフォルトは CSV（JSONではない）。
+    - JSON指定時でも応答は単一オブジェクトではなく「配列」
+      （array of {type, open, close}）。
+    ここでは他エンドポイント（open_interest, greeks/eod）と同じくCSVで統一し、
+    ヘッダ行を除いた最初のデータ行から type 列を取り出す。
+    """
+    resp, _ = _get_with_retry(
+        client, f"{base_url}/calendar/on_date", {"date": fmt_date(d), "format": "csv"}
+    )
     if resp is None:
         raise RuntimeError(f"calendar/on_date({d}) が通信エラーで取得できなかった")
     if resp.status_code == NO_DATA_CODE:
         raise RuntimeError(f"calendar/on_date({d}) で NO_DATA は想定外の応答")
-    return resp.json()["type"]
+    rows = list(csv.DictReader(io.StringIO(resp.text)))
+    if not rows:
+        raise RuntimeError(
+            f"calendar/on_date({d}) の応答が空で type を取得できない: {resp.text[:200]!r}"
+        )
+    return rows[0]["type"]
 
 
 def resolve_previous_trading_day(client: httpx.Client, base_url: str, as_of: date) -> date:
@@ -175,16 +192,26 @@ def count_csv_rows(text: str) -> int:
     return max(0, len(rows) - 1) if rows else 0
 
 
+def compute_content_hash(text: str) -> str:
+    """
+    レスポンス本文全体のハッシュ（先頭16文字に短縮）。
+    行数が同じでも中身(各行のOI値)が変わっていないかを検出するための
+    独立したシグナル。個人購読データそのものはログに残さず、
+    ハッシュ値だけを記録する。
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
 def fetch_row_count(
     client: httpx.Client, url: str, params: dict
-) -> tuple[int, int, int]:
-    """戻り値: (http_status, row_count, elapsed_ms)。通信欠測時は (-1, -1, 0)。"""
+) -> tuple[int, int, int, str]:
+    """戻り値: (http_status, row_count, elapsed_ms, content_hash)。通信欠測時は (-1, -1, 0, "")。"""
     resp, elapsed_ms = _get_with_retry(client, url, params)
     if resp is None:
-        return -1, -1, 0
+        return -1, -1, 0, ""
     if resp.status_code == NO_DATA_CODE:
-        return resp.status_code, 0, elapsed_ms
-    return resp.status_code, count_csv_rows(resp.text), elapsed_ms
+        return resp.status_code, 0, elapsed_ms, ""
+    return resp.status_code, count_csv_rows(resp.text), elapsed_ms, compute_content_hash(resp.text)
 
 
 def interval_seconds_for(now: datetime) -> int:
@@ -202,18 +229,34 @@ def _append_record(out_path: Path, rec: PollRecord) -> None:
         f.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
 
 
-def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
+def run_probe(
+    symbol: str, base_url: str, output_dir: Path, trade_date_override: date | None = None
+) -> int:
     with httpx.Client() as client:
-        today_et = now_et().date()
+        if trade_date_override is not None:
+            # 明示指定モード: 「今日が取引日か」のゲートは適用しない。
+            # 週末を挟む金曜分などを、土曜日(非取引日)に起動して狙う場合に使う。
+            # 指定日自体が取引日だったかだけは確認する(誤指定の早期検出)。
+            override_type = fetch_calendar_type(client, base_url, trade_date_override)
+            if override_type not in TRADING_DAY_TYPES:
+                print(
+                    f"--trade-date で指定された {trade_date_override} は取引日ではない "
+                    f"(type={override_type})。指定を確認すること。"
+                )
+                return 0
+            trade_date = trade_date_override
+            print(f"probe 対象 T = {trade_date}（--trade-date で明示指定）")
+        else:
+            today_et = now_et().date()
 
-        # 前提チェック: 今日自体が取引日でなければ probe を実行せず即終了
-        today_type = fetch_calendar_type(client, base_url, today_et)
-        if today_type not in TRADING_DAY_TYPES:
-            print(f"{today_et} は取引日ではない (type={today_type})。probe を実行せず終了。")
-            return 0
+            # 前提チェック: 今日自体が取引日でなければ probe を実行せず即終了
+            today_type = fetch_calendar_type(client, base_url, today_et)
+            if today_type not in TRADING_DAY_TYPES:
+                print(f"{today_et} は取引日ではない (type={today_type})。probe を実行せず終了。")
+                return 0
 
-        trade_date = resolve_previous_trading_day(client, base_url, today_et)
-        print(f"probe 対象 T = {trade_date}（今日 {today_et} の前営業日）")
+            trade_date = resolve_previous_trading_day(client, base_url, today_et)
+            print(f"probe 対象 T = {trade_date}（今日 {today_et} の前営業日）")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / f"oi_boundary_{trade_date.isoformat()}.jsonl"
@@ -223,7 +266,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
         # 常に成功する想定。ここで失敗する場合は「境界」ではなく前夜の
         # 生成自体が失敗した別障害として扱う。
         try:
-            g_status, g_rows, g_ms = fetch_row_count(
+            g_status, g_rows, g_ms, g_hash = fetch_row_count(
                 client,
                 f"{base_url}/option/history/greeks/eod",
                 {
@@ -231,6 +274,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     "expiration": "*",
                     "start_date": fmt_date(trade_date),
                     "end_date": fmt_date(trade_date),
+                    "format": "csv",
                 },
             )
             _append_record(
@@ -243,6 +287,7 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     http_status=g_status,
                     row_count=g_rows,
                     elapsed_ms=g_ms,
+                    content_hash=g_hash,
                     note="前日夜間生成分の健全性チェック。境界計測の対象外。",
                 ),
             )
@@ -256,18 +301,23 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
             print(f"警告: greeks/eod 健全性チェックで例外: {exc}。OI probe は続行する。")
 
         # --- 本題: open_interest の境界を実測するループ ---
-        cutoff = datetime.combine(today_et, _CUTOFF_0925, tzinfo=ET)
+        # cutoff は「T がいつか」に関わらず、常に「今実行している暦日の09:25 ET」。
+        # --trade-date 明示指定モード(土曜起動など)でも、実行している暦日自体は
+        # 土曜のままなので、その日の09:25が締切になる(通常モードと同じ理屈)。
+        run_date = now_et().date()
+        cutoff = datetime.combine(run_date, _CUTOFF_0925, tzinfo=ET)
         prev_row_count: int | None = None
+        prev_content_hash: str | None = None
         stable_count = 0
         converged = False
         first_poll = True
 
         while now_et() < cutoff:
             t_now = now_et()
-            status, row_count, elapsed_ms = fetch_row_count(
+            status, row_count, elapsed_ms, content_hash = fetch_row_count(
                 client,
                 f"{base_url}/option/history/open_interest",
-                {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date)},
+                {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date), "format": "csv"},
             )
             note = "" if status != -1 else "通信欠測（リトライ上限到達）。この回は欠測扱い。"
 
@@ -295,18 +345,28 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
                     http_status=status,
                     row_count=row_count,
                     elapsed_ms=elapsed_ms,
+                    content_hash=content_hash,
                     note=note,
                 ),
             )
-            print(f"[{t_now.strftime('%H:%M:%S %Z')}] status={status} rows={row_count} {note}")
+            print(f"[{t_now.strftime('%H:%M:%S %Z')}] status={status} rows={row_count} hash={content_hash} {note}")
 
-            if row_count > 0 and row_count == prev_row_count:
+            # 収束判定: 行数だけでなく content_hash も2回連続で一致することを
+            # 要求する。行数が同じでも中身(各行のOI値)が訂正されている
+            # ケースを、行数だけの判定では見逃すため（2026-07-XX 追加）。
+            is_stable_match = (
+                row_count > 0
+                and row_count == prev_row_count
+                and content_hash
+                and content_hash == prev_content_hash
+            )
+            if is_stable_match:
                 stable_count += 1
                 if stable_count >= 2:
                     converged = True
                     print(
-                        f"収束: {t_now.strftime('%H:%M:%S %Z')} 時点で行数 {row_count} が"
-                        f"2回連続一致。T={trade_date} の OI 境界とみなす。"
+                        f"収束: {t_now.strftime('%H:%M:%S %Z')} 時点で行数 {row_count} と"
+                        f"content_hash が2回連続一致。T={trade_date} の OI 境界とみなす。"
                     )
                     break
             else:
@@ -314,6 +374,8 @@ def run_probe(symbol: str, base_url: str, output_dir: Path) -> int:
 
             if row_count >= 0:
                 prev_row_count = row_count
+            if content_hash:
+                prev_content_hash = content_hash
 
             time.sleep(interval_seconds_for(now_et()))
 
@@ -333,9 +395,46 @@ def main() -> int:
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--base-url", default="http://127.0.0.1:25503/v3")
     parser.add_argument("--output-dir", default="probe_results", type=Path)
+    parser.add_argument(
+        "--trade-date",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "対象取引日を明示指定する。省略時は実行日の前営業日を自動解決する"
+            "(平日朝の通常運用)。週末を挟む金曜分を土曜日に観測する場合など、"
+            "「今日」自体が取引日でない日に起動する際に使う。"
+        ),
+    )
     args = parser.parse_args()
 
-    return run_probe(args.symbol, args.base_url, args.output_dir)
+    trade_date_override = None
+    if args.trade_date:
+        try:
+            trade_date_override = datetime.strptime(args.trade_date, "%Y-%m-%d").date()
+        except ValueError:
+            print(
+                f"FATAL: --trade-date の形式が不正: {args.trade_date!r} "
+                f"(YYYY-MM-DD 形式で指定すること)",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        return run_probe(args.symbol, args.base_url, args.output_dir, trade_date_override)
+    except Exception:
+        # rc=1(未収束、想定内)と rc=2(予期しない例外、実装バグ)を区別する。
+        # workflow 側は rc=2 だけを「本物の失敗」として扱う設計
+        # （2026-07-08 のインシデント: continue-on-error が両者を区別
+        #   できず、クラッシュを「成功」として見せてしまっていたため）。
+        import traceback
+
+        traceback.print_exc()
+        print(
+            "FATAL: probe が予期しない例外で異常終了した(rc=2)。"
+            "これは「未収束」とは異なり、実装のバグの可能性が高い。",
+            file=sys.stderr,
+        )
+        return 2
 
 
 if __name__ == "__main__":
