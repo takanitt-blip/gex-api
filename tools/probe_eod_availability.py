@@ -88,6 +88,7 @@ class PollRecord:
     row_count: int
     elapsed_ms: int
     content_hash: str = ""
+    first_timestamp: str = ""
     note: str = ""
 
 
@@ -202,16 +203,45 @@ def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def extract_first_timestamp(text: str) -> str:
+    """
+    CSV応答の最初のデータ行から timestamp 列の値を取り出す。
+    この列が「データ配信時刻」なのか「セッション帰属時刻」なのかを
+    実データで確認するために記録する（2026-07-XX 追加、詳細は該当チャット）。
+    列が存在しない/空の場合は空文字を返す（サイレントに失敗しない、
+    後段で「取れなかった」と分かるように）。
+    """
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+        first = next(reader, None)
+        if first is None:
+            return ""
+        # 実スキーマの列名は "timestamp"。大文字小文字・前後空白の揺れに一応備える。
+        for key in first.keys():
+            if key and key.strip().lower() == "timestamp":
+                return (first[key] or "").strip()
+        return ""
+    except Exception:  # noqa: BLE001 - timestamp抽出の失敗は本題(境界測定)を止めない
+        return ""
+
+
 def fetch_row_count(
     client: httpx.Client, url: str, params: dict
-) -> tuple[int, int, int, str]:
-    """戻り値: (http_status, row_count, elapsed_ms, content_hash)。通信欠測時は (-1, -1, 0, "")。"""
+) -> tuple[int, int, int, str, str]:
+    """戻り値: (http_status, row_count, elapsed_ms, content_hash, first_timestamp)。
+    通信欠測時は (-1, -1, 0, "", "")。"""
     resp, elapsed_ms = _get_with_retry(client, url, params)
     if resp is None:
-        return -1, -1, 0, ""
+        return -1, -1, 0, "", ""
     if resp.status_code == NO_DATA_CODE:
-        return resp.status_code, 0, elapsed_ms, ""
-    return resp.status_code, count_csv_rows(resp.text), elapsed_ms, compute_content_hash(resp.text)
+        return resp.status_code, 0, elapsed_ms, "", ""
+    return (
+        resp.status_code,
+        count_csv_rows(resp.text),
+        elapsed_ms,
+        compute_content_hash(resp.text),
+        extract_first_timestamp(resp.text),
+    )
 
 
 def interval_seconds_for(now: datetime) -> int:
@@ -260,129 +290,144 @@ def run_probe(
 
         output_dir.mkdir(parents=True, exist_ok=True)
         out_path = output_dir / f"oi_boundary_{trade_date.isoformat()}.jsonl"
+        # --- 本題: OI と greeks/eod 両方の境界を実測するループ ---
+        #
+        # 【設計変更 2026-07-XX】
+        # 以前は greeks/eod を「ループ前に1回だけ叩く健全性チェック」に
+        # していたが、実測(T=7/8,7/9,7/10)で「深夜0時台前半は greeks も
+        # まだ 472(未生成)」と判明し、当初前提(前日17:15生成済み)が崩れた。
+        # 本番の get_option_chain は IV(greeks側) と OI の両方が揃って初めて
+        # 成立するため、その境界を測る本 probe も「両方が安定するまで」を
+        # 収束条件にする。これにより「どちらが後に揃うか(=本番cronが待つ
+        # べき遅い方の境界)」を同一時間軸で直接比較できる(誤判断29の
+        # 「派生データの真の境界は全入力の最遅で決まる」に対応)。
+        #
+        # 収束条件: OI と greeks/eod が【両方とも】row_count+content_hash で
+        # 2回連続一致すること。片方だけ来ない日は収束せず未収束(rc=1)に
+        # なるが、それは「本番でもその日はチェーンを組めない」という
+        # 正しい異常検知。
+        run_date = now_et().date()
+        cutoff = datetime.combine(run_date, _CUTOFF_0925, tzinfo=ET)
 
-        # --- 診断: greeks/eod の健全性チェック（1回のみ、ループしない） ---
-        # 翌朝 cron 前提では前夜生成分に 12 時間以上の余裕があるはずで、
-        # 常に成功する想定。ここで失敗する場合は「境界」ではなく前夜の
-        # 生成自体が失敗した別障害として扱う。
-        try:
-            g_status, g_rows, g_ms, g_hash = fetch_row_count(
-                client,
-                f"{base_url}/option/history/greeks/eod",
-                {
+        endpoints = {
+            "open_interest": {
+                "url": f"{base_url}/option/history/open_interest",
+                "params": {
+                    "symbol": symbol,
+                    "expiration": "*",
+                    "date": fmt_date(trade_date),
+                    "format": "csv",
+                },
+            },
+            "greeks/eod": {
+                "url": f"{base_url}/option/history/greeks/eod",
+                "params": {
                     "symbol": symbol,
                     "expiration": "*",
                     "start_date": fmt_date(trade_date),
                     "end_date": fmt_date(trade_date),
                     "format": "csv",
                 },
-            )
-            _append_record(
-                out_path,
-                PollRecord(
-                    poll_time_et=now_et().isoformat(),
-                    poll_time_utc=now_utc_iso(),
-                    trade_date=trade_date.isoformat(),
-                    endpoint="greeks/eod(diagnostic_once)",
-                    http_status=g_status,
-                    row_count=g_rows,
-                    elapsed_ms=g_ms,
-                    content_hash=g_hash,
-                    note="前日夜間生成分の健全性チェック。境界計測の対象外。",
-                ),
-            )
-            if g_rows <= 0:
-                print(
-                    "警告: greeks/eod(前日分) が 0 行以下。翌朝 cron の前提"
-                    "（前夜生成が完了している）が崩れている可能性。要調査。"
-                    " OI probe は続行する。"
-                )
-        except Exception as exc:  # noqa: BLE001 - 診断チェックは失敗しても本題を止めない
-            print(f"警告: greeks/eod 健全性チェックで例外: {exc}。OI probe は続行する。")
+            },
+        }
 
-        # --- 本題: open_interest の境界を実測するループ ---
-        # cutoff は「T がいつか」に関わらず、常に「今実行している暦日の09:25 ET」。
-        # --trade-date 明示指定モード(土曜起動など)でも、実行している暦日自体は
-        # 土曜のままなので、その日の09:25が締切になる(通常モードと同じ理屈)。
-        run_date = now_et().date()
-        cutoff = datetime.combine(run_date, _CUTOFF_0925, tzinfo=ET)
-        prev_row_count: int | None = None
-        prev_content_hash: str | None = None
-        stable_count = 0
+        # エンドポイントごとの安定判定の状態を独立に持つ
+        state = {
+            name: {"prev_rows": None, "prev_hash": None, "stable": 0, "converged_at": None}
+            for name in endpoints
+        }
+        first_poll = {name: True for name in endpoints}
         converged = False
-        first_poll = True
 
         while now_et() < cutoff:
             t_now = now_et()
-            status, row_count, elapsed_ms, content_hash = fetch_row_count(
-                client,
-                f"{base_url}/option/history/open_interest",
-                {"symbol": symbol, "expiration": "*", "date": fmt_date(trade_date), "format": "csv"},
-            )
-            note = "" if status != -1 else "通信欠測（リトライ上限到達）。この回は欠測扱い。"
 
-            if first_poll and row_count > 0:
-                # cron の発火遅延（schedule トリガー時のジッター）等で、
-                # このジョブ自体の開始が想定より遅く、真の境界が既に
-                # 過ぎていた可能性がある。恣意的な閾値ではなく「観測の
-                # 限界」を明示するフラグ（左側打ち切り＝真値は不明、この
-                # 時刻より前としか言えない）。後段の分析で必ず参照すること。
-                note = (
-                    (note + " " if note else "")
-                    + "警告(左側打ち切り): 初回ポーリングから既に非ゼロ行。"
-                    "真の境界はこの実行開始時刻より前にある可能性があり、"
-                    "この日のサンプルを境界の実測値として信用してはならない。"
+            for name, spec in endpoints.items():
+                # 既に収束済みのエンドポイントは、無駄な再取得をしない
+                # （相手が揃うのを待つ間、重いリクエストを繰り返さない）。
+                if state[name]["converged_at"] is not None:
+                    continue
+
+                status, row_count, elapsed_ms, content_hash, first_ts = fetch_row_count(
+                    client, spec["url"], spec["params"]
                 )
-            first_poll = False
+                note = "" if status != -1 else "通信欠測（リトライ上限到達）。この回は欠測扱い。"
 
-            _append_record(
-                out_path,
-                PollRecord(
-                    poll_time_et=t_now.isoformat(),
-                    poll_time_utc=now_utc_iso(),
-                    trade_date=trade_date.isoformat(),
-                    endpoint="open_interest",
-                    http_status=status,
-                    row_count=row_count,
-                    elapsed_ms=elapsed_ms,
-                    content_hash=content_hash,
-                    note=note,
-                ),
-            )
-            print(f"[{t_now.strftime('%H:%M:%S %Z')}] status={status} rows={row_count} hash={content_hash} {note}")
-
-            # 収束判定: 行数だけでなく content_hash も2回連続で一致することを
-            # 要求する。行数が同じでも中身(各行のOI値)が訂正されている
-            # ケースを、行数だけの判定では見逃すため（2026-07-XX 追加）。
-            is_stable_match = (
-                row_count > 0
-                and row_count == prev_row_count
-                and content_hash
-                and content_hash == prev_content_hash
-            )
-            if is_stable_match:
-                stable_count += 1
-                if stable_count >= 2:
-                    converged = True
-                    print(
-                        f"収束: {t_now.strftime('%H:%M:%S %Z')} 時点で行数 {row_count} と"
-                        f"content_hash が2回連続一致。T={trade_date} の OI 境界とみなす。"
+                if first_poll[name] and row_count > 0:
+                    note = (
+                        (note + " " if note else "")
+                        + f"警告(左側打ち切り): {name} は初回ポーリングから既に非ゼロ行。"
+                        "真の境界はこの実行開始時刻より前にある可能性があり、"
+                        "この日のこのendpointの境界を実測値として信用してはならない。"
                     )
-                    break
-            else:
-                stable_count = 0
+                first_poll[name] = False
 
-            if row_count >= 0:
-                prev_row_count = row_count
-            if content_hash:
-                prev_content_hash = content_hash
+                _append_record(
+                    out_path,
+                    PollRecord(
+                        poll_time_et=t_now.isoformat(),
+                        poll_time_utc=now_utc_iso(),
+                        trade_date=trade_date.isoformat(),
+                        endpoint=name,
+                        http_status=status,
+                        row_count=row_count,
+                        elapsed_ms=elapsed_ms,
+                        content_hash=content_hash,
+                        first_timestamp=first_ts,
+                        note=note,
+                    ),
+                )
+                print(
+                    f"[{t_now.strftime('%H:%M:%S %Z')}] {name:14} status={status} "
+                    f"rows={row_count} hash={content_hash} ts={first_ts} {note}"
+                )
+
+                st = state[name]
+                is_stable_match = (
+                    row_count > 0
+                    and row_count == st["prev_rows"]
+                    and content_hash
+                    and content_hash == st["prev_hash"]
+                )
+                if is_stable_match:
+                    st["stable"] += 1
+                    if st["stable"] >= 2:
+                        st["converged_at"] = t_now
+                        print(
+                            f"  → {name} 収束: {t_now.strftime('%H:%M:%S %Z')} 時点で "
+                            f"row_count/content_hash が2回連続一致。"
+                        )
+                else:
+                    st["stable"] = 0
+
+                if row_count >= 0:
+                    st["prev_rows"] = row_count
+                if content_hash:
+                    st["prev_hash"] = content_hash
+
+            # 両方のエンドポイントが収束したら終了
+            if all(state[name]["converged_at"] is not None for name in endpoints):
+                converged = True
+                oi_at = state["open_interest"]["converged_at"]
+                gr_at = state["greeks/eod"]["converged_at"]
+                later = max(oi_at, gr_at)
+                print(
+                    f"全収束: OI={oi_at.strftime('%H:%M:%S')} / "
+                    f"greeks={gr_at.strftime('%H:%M:%S')}。"
+                    f"本番cronが待つべき遅い方の境界 = {later.strftime('%H:%M:%S %Z')}。"
+                    f"T={trade_date}。"
+                )
+                break
 
             time.sleep(interval_seconds_for(now_et()))
 
         if not converged:
+            oi_ok = state["open_interest"]["converged_at"] is not None
+            gr_ok = state["greeks/eod"]["converged_at"] is not None
             print(
-                f"未収束: 09:25 ET までに行数の安定を確認できなかった。"
-                f"T={trade_date} はこの日、締切内に OI が揃わなかった可能性がある。"
+                f"未収束: 09:25 ET までに両エンドポイントの安定を確認できなかった。"
+                f"(OI収束={oi_ok}, greeks収束={gr_ok}) "
+                f"T={trade_date} はこの日、締切内にデータが揃わなかった可能性がある。"
                 f"ログ({out_path})を必ず確認すること。"
             )
             return 1
