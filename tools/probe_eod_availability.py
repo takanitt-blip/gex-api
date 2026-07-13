@@ -88,6 +88,7 @@ class PollRecord:
     row_count: int
     elapsed_ms: int
     content_hash: str = ""
+    sorted_hash: str = ""
     first_timestamp: str = ""
     note: str = ""
 
@@ -203,6 +204,30 @@ def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def compute_sorted_hash(text: str) -> str:
+    """
+    データ行を「行単位でソートしてから」ハッシュ化した値（先頭16文字）。
+    生の content_hash と併記することで、hash の揺らぎの原因を切り分ける
+    （2026-07-10 に greeks/eod で「行数は同じなのに hash が一瞬変わって
+    元に戻る」現象を観測したことへの対応）:
+      - 生hashは揺れるが sorted hash は安定 → 原因は「行の並び順の非決定性」
+        （データの中身自体は同じ。実害なし）
+      - 生hashも sorted hash も両方揺れる → 原因は「値そのものの変動」
+        （生成過渡状態の可能性。本番cron時刻の設計に直結する重大事象）
+    ヘッダ行は除いてデータ行のみをソート対象にする（ヘッダは常に先頭固定）。
+    パース不能な場合は空文字を返す（判定側で「取れなかった」と分かるように）。
+    """
+    try:
+        lines = text.splitlines()
+        if len(lines) <= 1:
+            return ""
+        header, data_rows = lines[0], sorted(lines[1:])
+        normalized = header + "\n" + "\n".join(data_rows)
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    except Exception:  # noqa: BLE001 - sorted hash 算出失敗は本題(境界測定)を止めない
+        return ""
+
+
 def extract_first_timestamp(text: str) -> str:
     """
     CSV応答の最初のデータ行から timestamp 列の値を取り出す。
@@ -227,19 +252,20 @@ def extract_first_timestamp(text: str) -> str:
 
 def fetch_row_count(
     client: httpx.Client, url: str, params: dict
-) -> tuple[int, int, int, str, str]:
-    """戻り値: (http_status, row_count, elapsed_ms, content_hash, first_timestamp)。
-    通信欠測時は (-1, -1, 0, "", "")。"""
+) -> tuple[int, int, int, str, str, str]:
+    """戻り値: (http_status, row_count, elapsed_ms, content_hash, sorted_hash, first_timestamp)。
+    通信欠測時は (-1, -1, 0, "", "", "")。"""
     resp, elapsed_ms = _get_with_retry(client, url, params)
     if resp is None:
-        return -1, -1, 0, "", ""
+        return -1, -1, 0, "", "", ""
     if resp.status_code == NO_DATA_CODE:
-        return resp.status_code, 0, elapsed_ms, "", ""
+        return resp.status_code, 0, elapsed_ms, "", "", ""
     return (
         resp.status_code,
         count_csv_rows(resp.text),
         elapsed_ms,
         compute_content_hash(resp.text),
+        compute_sorted_hash(resp.text),
         extract_first_timestamp(resp.text),
     )
 
@@ -336,6 +362,9 @@ def run_probe(
             name: {"prev_rows": None, "prev_hash": None, "stable": 0, "converged_at": None}
             for name in endpoints
         }
+        # 生hash/ソートhashの直前値（並び順のみ変化したかの検出用、ログ表示専用）
+        st_prev_raw: dict[str, str] = {}
+        st_prev_sorted: dict[str, str] = {}
         first_poll = {name: True for name in endpoints}
         converged = False
 
@@ -348,10 +377,16 @@ def run_probe(
                 if state[name]["converged_at"] is not None:
                     continue
 
-                status, row_count, elapsed_ms, content_hash, first_ts = fetch_row_count(
-                    client, spec["url"], spec["params"]
+                status, row_count, elapsed_ms, content_hash, sorted_hash, first_ts = (
+                    fetch_row_count(client, spec["url"], spec["params"])
                 )
                 note = "" if status != -1 else "通信欠測（リトライ上限到達）。この回は欠測扱い。"
+
+                # 生hashとソートhashが食い違ったら、その回に印を付けておく
+                # （並び順ノイズが起きた瞬間を後から追えるように）。
+                if content_hash and sorted_hash and row_count > 0:
+                    # ここでは印だけ。実際の一致判定は下の sorted_hash 基準で行う。
+                    pass
 
                 if first_poll[name] and row_count > 0:
                     note = (
@@ -373,21 +408,38 @@ def run_probe(
                         row_count=row_count,
                         elapsed_ms=elapsed_ms,
                         content_hash=content_hash,
+                        sorted_hash=sorted_hash,
                         first_timestamp=first_ts,
                         note=note,
                     ),
                 )
+                raw_flag = ""
+                if (
+                    content_hash
+                    and sorted_hash
+                    and st_prev_raw.get(name)
+                    and content_hash != st_prev_raw[name]
+                    and sorted_hash == st_prev_sorted.get(name)
+                ):
+                    raw_flag = " [並び順のみ変化: 生hashは変わったがソートhashは不変]"
                 print(
                     f"[{t_now.strftime('%H:%M:%S %Z')}] {name:14} status={status} "
-                    f"rows={row_count} hash={content_hash} ts={first_ts} {note}"
+                    f"rows={row_count} raw={content_hash} sorted={sorted_hash} "
+                    f"ts={first_ts}{raw_flag} {note}"
                 )
+                st_prev_raw[name] = content_hash
+                st_prev_sorted[name] = sorted_hash
 
                 st = state[name]
+                # 収束判定はソート版hashを基準にする。並び順の非決定性
+                # (可能性A)による無害な揺らぎで収束が無駄に遅れるのを防ぐ。
+                # 値そのものの変動(可能性B)ならソートhashも変わるので、
+                # その場合は正しく「不安定」と判定され収束しない。
                 is_stable_match = (
                     row_count > 0
                     and row_count == st["prev_rows"]
-                    and content_hash
-                    and content_hash == st["prev_hash"]
+                    and sorted_hash
+                    and sorted_hash == st["prev_hash"]
                 )
                 if is_stable_match:
                     st["stable"] += 1
@@ -395,15 +447,15 @@ def run_probe(
                         st["converged_at"] = t_now
                         print(
                             f"  → {name} 収束: {t_now.strftime('%H:%M:%S %Z')} 時点で "
-                            f"row_count/content_hash が2回連続一致。"
+                            f"row_count/sorted_hash が2回連続一致。"
                         )
                 else:
                     st["stable"] = 0
 
                 if row_count >= 0:
                     st["prev_rows"] = row_count
-                if content_hash:
-                    st["prev_hash"] = content_hash
+                if sorted_hash:
+                    st["prev_hash"] = sorted_hash
 
             # 両方のエンドポイントが収束したら終了
             if all(state[name]["converged_at"] is not None for name in endpoints):
