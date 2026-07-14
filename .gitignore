@@ -13,3 +13,5 @@ v2a_prime_per_session.csv
 
 # probe_eod_availability.py のローカル実行結果（Actions artifact に保存、リポジトリには含めない）
 probe_results/
+
+greeks_drift_snapshots/
