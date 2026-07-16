@@ -7858,5 +7858,20 @@
     "symbol": "SPY",
     "as_of": "2026-07-14T00:00:00",
     "n_contracts_used": 16232675
+  },
+  "2026.07.16": {
+    "data_quality": "ok",
+    "call_wall": 760.0,
+    "put_wall": 740.0,
+    "zero_gamma": 752.16,
+    "max_pain": 740.0,
+    "underlying_price": 754.81,
+    "z_position": "inside",
+    "total_gex": 4014445283,
+    "timestamp": "2026-07-16T22:40:49Z",
+    "data_source": "rest",
+    "symbol": "SPY",
+    "as_of": "2026-07-15T00:00:00",
+    "n_contracts_used": 15766411
   }
 }
