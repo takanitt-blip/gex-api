@@ -1,6 +1,47 @@
 name: Update GEX History
 
 # ─────────────────────────────────────────────────────────────
+# v19: 誤判断36 本体修正 ── cron を生成境界直後（ET 未明）へ移行
+# ─────────────────────────────────────────────────────────────
+# 背景（PC_GOVERNANCE 誤判断36 / PC_PIPELINE §5.10）:
+#   旧 cron（UTC 21:47 = ET 17:47/18:47、引けと同日の夕方）は、
+#   as_of がまだ「引けた当日」を指す時間帯に発火していた。この時点
+#   では greeks/eod は未生成（生成完了は引けから約9時間後）なため、
+#   rest.py の _resolve_trade_date は安全側に倒れて as_of の「前営業日」
+#   を返す設計になっており、結果として本来使えるはずの最新1営業日分の
+#   鮮度を毎回失っていた。
+#
+#   2026-07-04〜07-18 の実測キャンペーン（tools/probe_eod_availability.py）
+#   で、greeks/eod の生成完了は引けから 8h57m〜9h10m 後（月〜木は
+#   ET 00:57〜00:59、金曜のみ ET 01:10 と外れる、n=5）と確定した。
+#
+#   これを受けて cron を「引けの翌未明」へ移動する。as_of が既に
+#   「引けの翌暦日」を指す時間帯に発火すれば、_resolve_trade_date の
+#   ロジック（as_of の前日から遡る）自体は無変更のまま、正しく
+#   「直近の引けた取引日」を安全に取得できる（rest.py 側の docstring
+#   にも同じ説明を明記済み）。
+#
+# 変更点 (v18 → v19):
+#   - cron: '47 21 * * 1-5' (UTC 21:47) → '30 6 * * 2-6' (UTC 06:30)
+#     曜日も 1-5(月-金) → 2-6(火-土) にずらしている点に注意。
+#     「月〜金の引け」に対応する取得は「火〜土の未明」に発火する
+#     必要があるため（土曜の発火が金曜分の取得を担当する）。
+#     UTC 06:30 は EST(冬季) で ET 01:30、EDT(夏季) で ET 02:30 相当。
+#     金曜最遅実測(ET 01:10)からのマージンは冬季 20分・夏季 1h20m。
+#     このマージンを使い切るケースは run_daily.py 側の収束待ち
+#     リトライ（デッドライン ET 06:45）で吸収する設計。
+#   - run_daily.py: get_option_chain が空でも即座に諦めず、
+#     ET 06:45 まで5分間隔でリトライする（誤判断36 対応、
+#     run_daily.py 側のモジュール docstring 参照）。
+#   - ヘルスチェック URL の expiration/date を実行日基準の動的値に変更
+#     （obs.K: 固定日付 2026-06-18 / 20260512 が陳腐化するリスクへの
+#     予防的対応。tools/probe_eod_availability.yml で先行導入済みの
+#     「実行日の30日前」方式を踏襲）。
+#   - timeout-minutes を明示。冬季 cron 起点(ET01:30)からデッドライン
+#     (ET06:45)までの最大待機幅は約5h15m=315分。セットアップ/後片付けの
+#     余裕を見て 340 分に設定（GitHub Actions 既定の 360 分上限に収める）。
+#
+# ─────────────────────────────────────────────────────────────
 # v18: snapshot → history 全面移行に伴う修正
 # ─────────────────────────────────────────────────────────────
 # rest.py が snapshot から history エンドポイントへ全面再設計された
@@ -50,10 +91,12 @@ name: Update GEX History
 # ─────────────────────────────────────────────────────────────
 
 on:
-  # ── 段階 6D で時刻調整 (v17.4) ──
+  # ── v19 で cron を生成境界直後（ET 未明）へ移行（誤判断36 本体修正）──
+  # 曜日は 2-6（火-土）。月〜金の引けに対応する取得はそれぞれ翌暦日の
+  # 未明に発火する必要があるため（土曜の発火が金曜分を担当）。
   schedule:
-    - cron: '47 21 * * 1-5'   # UTC 21:47 (ET 17:47 EDT / 18:47 EST)
-  workflow_dispatch:           # 手動実行も引き続き可能
+    - cron: '30 6 * * 2-6'   # UTC 06:30 (ET 01:30 EST / 02:30 EDT)
+  workflow_dispatch:           # 手動実行も引き続き可能（デッドライン超過時のバックアップ用途にも使用）
 
 permissions:
   contents: write              # gex_history.json を commit & push するため
@@ -61,6 +104,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # v19: 冬季 cron 起点(ET01:30)からデッドライン(ET06:45)までの最大
+    # 待機幅は約5h15m=315分。セットアップ/後片付けの余裕を見て340分に
+    # 設定（GitHub Actions 既定の360分上限に収める。詳細は冒頭コメント）。
+    timeout-minutes: 340
     steps:
       # ───── 環境構築 ─────
       - name: Checkout repository
@@ -148,16 +195,26 @@ jobs:
         #             権限と疎通の確認が目的。history なので過去日付の
         #             データは安定して返る。
         #
-        #   ⚠️ 実装後検証項目: 固定の expiration=2026-06-18 は 2026-06 に
-        #     満期を迎える。満期後も history/greeks/eod が「過去満期の
-        #     過去データ」を返すかは実機で要確認。返さなくなった場合は
-        #     ヘルスチェックの固定満期を、より新しい満期に更新する。
+        #   ⚠️ 実装後検証項目 → obs.K で決着 (v19):
+        #     固定 expiration=2026-06-18 は満期後も history/greeks/eod が
+        #     過去満期の過去データを問題なく返し続けることを実データで
+        #     確認済み（gex_history.json の 07/01・07/02・07/06 エントリが
+        #     満期経過後も正常生成）。ただし固定値は将来また陳腐化が
+        #     心配になる書き方であり、tools/probe_eod_availability.yml で
+        #     先行導入済みの「実行日の30日前」動的計算方式に合わせる
+        #     （予防的対応、obs.K）。
         #
         #   curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
         #   || echo "000" は不要（付けると "000000" の二重出力になる）。
         run: |
           set +e  # curl 失敗時に即座に exit しない
-          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=2026-06-18&start_date=20260512&end_date=20260512&format=csv"
+          # v19: 固定日付ではなく実行日基準（UTC、30日前）で動的計算。
+          # expiration・start_date・end_date とも同じ過去日でよい
+          # （疎通と権限確認が目的で、本番の取得日とは無関係）。
+          HEALTHCHECK_DATE=$(date -u -d '30 days ago' +%Y%m%d)
+          HEALTHCHECK_EXPIRATION=$(date -u -d '30 days ago' +%Y-%m-%d)
+          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=${HEALTHCHECK_EXPIRATION}&start_date=${HEALTHCHECK_DATE}&end_date=${HEALTHCHECK_DATE}&format=csv"
+          echo "Healthcheck date: ${HEALTHCHECK_DATE} (expiration=${HEALTHCHECK_EXPIRATION})"
           for i in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
             if [ "$status" = "200" ]; then
