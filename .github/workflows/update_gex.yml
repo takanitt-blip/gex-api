@@ -1,6 +1,24 @@
 name: Update GEX History
 
 # ─────────────────────────────────────────────────────────────
+# v20: ヘルスチェックの日付バグ修正（v19 で作り込んだ回帰）
+# ─────────────────────────────────────────────────────────────
+# v19 で「固定日付の陳腐化」(obs.K) 対策として expiration と
+# start_date/end_date を両方とも「実行日の30日前」に動的化したが、
+# これは誤りだった。expiration（どの満期契約を見るか）と
+# start_date/end_date（いつ時点のスナップショットを見るか）は本来
+# 独立した軸で、両方を同じ過去日にすると「その日が満期日である契約の、
+# 満期当日のグリークス」という実在しない（か極端すぎる）組み合わせに
+# なり、472 (NO_DATA) を返し続けてヘルスチェックが失敗した
+# （2026-07-19 実機で確認、Actions Run 失敗ログより）。
+#
+# 修正: 満期日を推測で決め打ちし直すのではなく（誤判断22 の教訓）、
+# /v3/option/list/expirations から実在する満期日を動的に取得して使う。
+# この一覧取得自体を Terminal 起動待ちの第一段階として使い、取得できた
+# 満期日のうち最も先（＝ start_date/end_date より確実に未来）のものを
+# 本来のヘルスチェック (history/greeks/eod) に渡す。
+#
+# ─────────────────────────────────────────────────────────────
 # v19: 誤判断36 本体修正 ── cron を生成境界直後（ET 未明）へ移行
 # ─────────────────────────────────────────────────────────────
 # 背景（PC_GOVERNANCE 誤判断36 / PC_PIPELINE §5.10）:
@@ -36,7 +54,8 @@ name: Update GEX History
 #   - ヘルスチェック URL の expiration/date を実行日基準の動的値に変更
 #     （obs.K: 固定日付 2026-06-18 / 20260512 が陳腐化するリスクへの
 #     予防的対応。tools/probe_eod_availability.yml で先行導入済みの
-#     「実行日の30日前」方式を踏襲）。
+#     「実行日の30日前」方式を踏襲）。★ この一次実装は日付バグを含んで
+#     いたため v20 で修正（上記参照）。
 #   - timeout-minutes を明示。冬季 cron 起点(ET01:30)からデッドライン
 #     (ET06:45)までの最大待機幅は約5h15m=315分。セットアップ/後片付けの
 #     余裕を見て 340 分に設定（GitHub Actions 既定の 360 分上限に収める）。
@@ -200,31 +219,71 @@ jobs:
         #     過去満期の過去データを問題なく返し続けることを実データで
         #     確認済み（gex_history.json の 07/01・07/02・07/06 エントリが
         #     満期経過後も正常生成）。ただし固定値は将来また陳腐化が
-        #     心配になる書き方であり、tools/probe_eod_availability.yml で
-        #     先行導入済みの「実行日の30日前」動的計算方式に合わせる
-        #     （予防的対応、obs.K）。
+        #     心配になる書き方であり、動的化を検討した。
+        #
+        #   ⚠️ v20 修正: v19 で expiration と start_date/end_date を
+        #     両方とも「実行日の30日前」に動的化したところ、両者は
+        #     本来独立した軸（expiration=どの満期契約か、
+        #     start_date/end_date=いつ時点のスナップショットか）なのに
+        #     同じ過去日を渡してしまい、「その日が満期日である契約の
+        #     満期当日のグリークス」という実在しない組み合わせを問い
+        #     合わせて 472 (NO_DATA) を返し続ける回帰を作り込んだ
+        #     （2026-07-19 実機で確認）。満期日を推測で決め打ちし直す
+        #     ことも誤判断22 の教訓に反するため、/v3/option/list/expirations
+        #     から実在する満期日一覧を動的に取得し、start_date/end_date
+        #     より確実に未来の満期（一覧の最後＝最も遠い満期）を使う形に
+        #     修正した。この一覧取得自体を Terminal 起動待ちの第一段階
+        #     としても使う（軽量なので 60 回ループしても負荷が小さい）。
         #
         #   curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
         #   || echo "000" は不要（付けると "000000" の二重出力になる）。
         run: |
           set +e  # curl 失敗時に即座に exit しない
-          # v19: 固定日付ではなく実行日基準（UTC、30日前）で動的計算。
-          # expiration・start_date・end_date とも同じ過去日でよい
-          # （疎通と権限確認が目的で、本番の取得日とは無関係）。
+
+          # v19: start_date/end_date は実行日基準（UTC、30日前）で動的計算。
+          # こちらは「過去の日付ならなんでもよい」軸なので動的化して問題ない。
           HEALTHCHECK_DATE=$(date -u -d '30 days ago' +%Y%m%d)
-          HEALTHCHECK_EXPIRATION=$(date -u -d '30 days ago' +%Y-%m-%d)
+
+          # v20: expiration は推測せず、実在する満期日一覧から取得する。
+          # レスポンスが空/失敗の間は Terminal 未起動とみなしリトライ
+          # （list/expirations は軽量なので、ここで 60 回叩いてもコスト小）。
+          HEALTHCHECK_EXPIRATION=""
+          for i in $(seq 1 60); do
+            EXP_LIST=$(curl -s "http://127.0.0.1:25503/v3/option/list/expirations?symbol=SPY&format=csv" 2>/dev/null               | awk -F',' '
+                  NR==1 {
+                    for (j=1; j<=NF; j++) { gsub(/\r/,"",$j); if ($j=="expiration") col=j }
+                    next
+                  }
+                  col { v=$col; gsub(/\r/,"",v); gsub(/"/,"",v); if (v != "") print v }
+                ' | sort)
+            HEALTHCHECK_EXPIRATION=$(echo "$EXP_LIST" | tail -1)
+            if [ -n "$HEALTHCHECK_EXPIRATION" ]; then
+              echo "Attempt ${i}/60 (phase A): expirations list ready, using furthest expiration=${HEALTHCHECK_EXPIRATION}"
+              break
+            fi
+            echo "Attempt ${i}/60 (phase A): expirations list not ready yet, waiting..."
+            sleep 1
+          done
+
+          if [ -z "$HEALTHCHECK_EXPIRATION" ]; then
+            echo "❌ Could not obtain SPY expirations list within 60 seconds"
+            echo "── theta_terminal.log (last 50 lines) ──"
+            tail -50 theta_terminal.log || true
+            exit 1
+          fi
+
           HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=${HEALTHCHECK_EXPIRATION}&start_date=${HEALTHCHECK_DATE}&end_date=${HEALTHCHECK_DATE}&format=csv"
           echo "Healthcheck date: ${HEALTHCHECK_DATE} (expiration=${HEALTHCHECK_EXPIRATION})"
           for i in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
             if [ "$status" = "200" ]; then
-              echo "Theta Terminal is ready (took ${i} seconds)"
+              echo "Theta Terminal is ready (took ${i} seconds in phase B)"
               exit 0
             fi
-            echo "Attempt ${i}/60: HTTP $status, waiting..."
+            echo "Attempt ${i}/60 (phase B): HTTP $status, waiting..."
             sleep 1
           done
-          echo "❌ Theta Terminal did not become ready within 60 seconds"
+          echo "❌ Theta Terminal did not become ready within 60 seconds (phase B)"
           echo "── theta_terminal.log (last 50 lines) ──"
           tail -50 theta_terminal.log || true
           exit 1
