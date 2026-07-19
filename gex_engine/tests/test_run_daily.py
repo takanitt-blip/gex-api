@@ -5,24 +5,48 @@
     - 未知の source でエラー
     - 例外時 main() が exit code 1 を返す
     - 正常時 main() が exit code 0 を返す
-    - 空 DataFrame（NO_DATA）でも書き込みスキップして exit code 0
+    - 空 DataFrame が続く場合はデッドライン到達で exit code 1
+      （誤判断36 対応、2026-07 実装。旧仕様の「NO_DATA→静かに exit 0」は
+      廃止。trade_date は calendar/on_date で検証済みのため、空応答は
+      常に要調査の異常として扱い Job を失敗させ、GitHub Actions 標準の
+      失敗通知を発火させる設計に変更した）
+    - _wait_for_option_chain / _compute_deadline の収束待ちロジック単体
 
 実際のフロー（Adapter → Core → I/O）は run_daily 専用で再テストせず、
 段階3.5 / 段階4 のスモークテストでカバーされる。
+
+誤判断36 対応のテストで real time.sleep を呼ばせないための方針:
+    - _wait_for_option_chain は poll_interval_seconds / sleep_fn を
+      引数で受け取れるので、単体テストでは 0 / fake に差し替える。
+    - main() 経由の end-to-end テストでデッドライン超過を再現する場合は
+      _compute_deadline を monkeypatch し、「既に過ぎた過去時刻」を
+      固定で返させる。これにより実時刻（今何時か）に一切依存せず、
+      1回目の空応答で即座に deadline 超過と判定される
+      （_wait_for_option_chain は sleep する前に deadline 判定するため）。
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
 
 from gex_engine.adapters.mock import MockDataFetcher
 from gex_engine.adapters.rest import ThetaRestAdapter
-from gex_engine.scripts.run_daily import main, make_fetcher
+from gex_engine.scripts import run_daily as run_daily_module
+from gex_engine.scripts.run_daily import (
+    DeadlineExceededError,
+    _compute_deadline,
+    _wait_for_option_chain,
+    main,
+    make_fetcher,
+)
+
+_ET = ZoneInfo("America/New_York")
 
 
 # ──────────────────────────────────────────────────────────
@@ -96,13 +120,28 @@ class TestMainExitCode:
 
         assert result == 0
 
-    def test_empty_dataframe_is_handled_gracefully(
+    def test_persistent_empty_dataframe_exceeds_deadline_and_fails(
         self, tmp_path, monkeypatch
     ):
-        """NO_DATA（休場日等）で空 DataFrame が返っても落ちない。
-        当日エントリを書かず、exit code 0 で終わる。"""
+        """誤判断36 対応: 空 DataFrame が続く場合、デッドライン到達で
+        exit code 1 になる（旧仕様の「静かに exit 0 でスキップ」は廃止）。
+
+        trade_date は Adapter 内部で calendar/on_date により検証済み
+        （休場日ではあり得ない）ため、空応答はデッドラインまでリトライし、
+        それでも解消しなければ要調査の異常として Job を失敗させる。
+
+        _compute_deadline を「既に過ぎた過去時刻」に固定することで、
+        実時刻や real time.sleep に依存せず高速・決定論的にテストする
+        （_wait_for_option_chain は sleep する前に deadline 判定するため、
+        1 回目の空応答で即座に DeadlineExceededError になる）。
+        """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("GEX_DATA_SOURCE", "mock")
+        monkeypatch.setattr(
+            run_daily_module,
+            "_compute_deadline",
+            lambda: datetime.now(_ET) - timedelta(hours=1),
+        )
 
         # MockDataFetcher.get_option_chain を空返しに差し替え
         with patch.object(
@@ -112,8 +151,8 @@ class TestMainExitCode:
         ):
             result = main()
 
-        assert result == 0
-        # 書き込みスキップなので JSON は作られない
+        assert result == 1
+        # 書き込みは行われないので JSON は作られない
         assert not (tmp_path / "gex_history.json").exists()
 
     def test_calculate_all_exception_returns_1(
@@ -385,3 +424,82 @@ class TestTradeDateFlow:
         assert result == 1
         # JSON は書かれていない (assert は GEX 計算の前)
         assert not (tmp_path / "gex_history.json").exists()
+
+
+# ──────────────────────────────────────────────────────────
+# 誤判断36: OI/greeks 収束待ちリトライの単体テスト
+# ──────────────────────────────────────────────────────────
+
+class TestWaitForOptionChain:
+    """_wait_for_option_chain の単体テスト。
+
+    real time.sleep を一切呼ばせず、poll_interval_seconds=0 と fake
+    sleep_fn で高速・決定論的に検証する。deadline は呼び出し側が明示的に
+    渡す設計（run() は _compute_deadline() 経由で実時刻から作るが、この
+    関数自体は実時刻に一切依存しない）。
+    """
+
+    def test_succeeds_on_first_attempt(self):
+        """初回から非空が返れば、即座にそれを返す（リトライなし）。"""
+        fetcher = MockDataFetcher(spot_price=450.0, seed=42)
+        future_deadline = datetime.now(_ET) + timedelta(hours=1)
+
+        df = _wait_for_option_chain(
+            fetcher, "SPY", date.today(), future_deadline,
+            poll_interval_seconds=0, sleep_fn=lambda s: None,
+        )
+
+        assert not df.empty
+
+    def test_retries_then_succeeds(self):
+        """空→空→成功、の順で返す場合、2回 sleep してから成功データを返す。"""
+        fetcher = MockDataFetcher(spot_price=450.0, seed=42)
+        real_df = fetcher.get_option_chain("SPY", date.today())
+        future_deadline = datetime.now(_ET) + timedelta(hours=1)
+        sleep_calls: list[int] = []
+
+        with patch.object(
+            MockDataFetcher,
+            "get_option_chain",
+            side_effect=[pd.DataFrame(), pd.DataFrame(), real_df],
+        ):
+            df = _wait_for_option_chain(
+                fetcher, "SPY", date.today(), future_deadline,
+                poll_interval_seconds=0, sleep_fn=sleep_calls.append,
+            )
+
+        assert not df.empty
+        assert len(sleep_calls) == 2  # 1回目・2回目の空応答後にそれぞれ1回
+
+    def test_raises_deadline_exceeded_when_always_empty(self):
+        """deadline が既に過去なら、1回目の空応答で即座に諦める
+        （sleep を呼ぶ前に deadline 判定するため、sleep は一度も呼ばれない）。
+        """
+        fetcher = MockDataFetcher(spot_price=450.0, seed=42)
+        past_deadline = datetime.now(_ET) - timedelta(hours=1)
+        sleep_calls: list[int] = []
+
+        with patch.object(
+            MockDataFetcher, "get_option_chain", return_value=pd.DataFrame(),
+        ):
+            with pytest.raises(DeadlineExceededError):
+                _wait_for_option_chain(
+                    fetcher, "SPY", date.today(), past_deadline,
+                    poll_interval_seconds=0, sleep_fn=sleep_calls.append,
+                )
+
+        assert sleep_calls == []
+
+
+class TestComputeDeadline:
+    """_compute_deadline の単体テスト。"""
+
+    def test_deadline_uses_et_hour_and_minute_constants(self):
+        deadline = _compute_deadline()
+
+        assert deadline.tzinfo is not None
+        assert deadline.hour == run_daily_module._DEADLINE_ET_HOUR
+        assert deadline.minute == run_daily_module._DEADLINE_ET_MINUTE
+        assert deadline.second == 0
+        # 日付を跨がない（当日の ET カレンダー日のまま）
+        assert deadline.date() == datetime.now(_ET).date()

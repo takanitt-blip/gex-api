@@ -10,3 +10,11 @@ scipy>=1.11       # Brent法 (zero_gamma 探索), norm.cdf (Black-Scholes)
 # === Test (GitHub Actions の CI で全テスト走らせるため同梱) ===
 pytest>=8.0       # テストランナー
 respx>=0.21       # httpx モック (test_rest_adapter で使用)
+
+# === Timezone (誤判断36 対応, v19 で追加) ===
+# run_daily.py が zoneinfo.ZoneInfo("America/New_York") でデッドライン
+# (_compute_deadline) を計算する。Ubuntu (GitHub Actions runner) は
+# システムに IANA tz データベースを持つため無くても動くが、Windows は
+# 標準でこのデータベースを持たず、tzdata が無いと ZoneInfoNotFoundError
+# で落ちる。taka さんの実機検証は Windows で行う運用のため必須。
+tzdata>=2024.1
