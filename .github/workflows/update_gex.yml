@@ -1,22 +1,25 @@
 name: Update GEX History
 
 # ─────────────────────────────────────────────────────────────
-# v20: ヘルスチェックの日付バグ修正（v19 で作り込んだ回帰）
+# v20: ヘルスチェックの日付バグ修正（v19 で作り込んだ回帰、2段階で確定）
 # ─────────────────────────────────────────────────────────────
 # v19 で「固定日付の陳腐化」(obs.K) 対策として expiration と
-# start_date/end_date を両方とも「実行日の30日前」に動的化したが、
-# これは誤りだった。expiration（どの満期契約を見るか）と
-# start_date/end_date（いつ時点のスナップショットを見るか）は本来
-# 独立した軸で、両方を同じ過去日にすると「その日が満期日である契約の、
-# 満期当日のグリークス」という実在しない（か極端すぎる）組み合わせに
-# なり、472 (NO_DATA) を返し続けてヘルスチェックが失敗した
-# （2026-07-19 実機で確認、Actions Run 失敗ログより）。
+# start_date/end_date を「実行日の30日前」に動的化したが、二重に誤った:
+#   (1) expiration（どの満期契約か）と start_date/end_date（いつ時点か）は
+#       独立した軸なのに両方「30日前」を渡し、「満期当日のグリークス」と
+#       いう実在しない組合せで 472 (NO_DATA) を返し続けた。
+#   (2) 一次修正で date を「30日前」の素朴な暦計算のままにしたら、それが
+#       2026-06-19（Juneteenth＝市場完全休場日）に着地し、休場日には EOD が
+#       無いため NOT_FOUND を返し続けた（2026-07-19 実機の Run 失敗で発覚。
+#       誤判断22「取引日でなければならない値を素朴な暦計算で決めない」の再演）。
 #
-# 修正: 満期日を推測で決め打ちし直すのではなく（誤判断22 の教訓）、
-# /v3/option/list/expirations から実在する満期日を動的に取得して使う。
-# この一覧取得自体を Terminal 起動待ちの第一段階として使い、取得できた
-# 満期日のうち最も先（＝ start_date/end_date より確実に未来）のものを
-# 本来のヘルスチェック (history/greeks/eod) に渡す。
+# 最終修正: expiration も date も推測・暦計算で決めず、実在するデータ一覧の
+# 中央値（median）から取る。expiration = list/expirations の中央値、
+# date = その満期の list/dates/quote の中央値。休場日には決して当たらず、
+# 最新端（greeks 未生成＝誤判断36）でも最古端（greeks 提供開始前＝誤判断29）
+# でもない安全な位置になる。最終段は従来どおり greeks/eod の 200 を確認し、
+# STANDARD 権限（471）検出という本来の目的（誤判断16）を維持する。
+# 詳細は下の "Wait for Theta Terminal health check" ステップのコメント参照。
 #
 # ─────────────────────────────────────────────────────────────
 # v19: 誤判断36 本体修正 ── cron を生成境界直後（ET 未明）へ移行
@@ -187,105 +190,100 @@ jobs:
           echo "$!" > theta_terminal.pid
 
       - name: Wait for Theta Terminal health check
-        # 最大 60 秒、1 秒ごとに本番エンドポイントを叩いて 200 を待つ。
+        # 本番中核エンドポイント greeks/eod で 200 を待つ（誤判断16: ヘルス
+        # チェックは本番が叩くエンドポイントで行い、STANDARD 権限が無い場合の
+        # 471 を検出できることが目的）。
         #
-        # ⚠️ v17.2 修正 (2026-05-10):
-        #   旧 yml では /v3/stock/list/symbols（Stock: FREE で叩ける軽量
-        #   エンドポイント）を使っていたが、これが偽陽性の原因だった。
-        #   段階 6B-2 で v2 jar が偶然 stock 系のヘルスチェックを通し、
-        #   段階 6C で初めて Option 系の REST API が叩けないと判明した。
-        #   （誤判断16: ヘルスチェック = 本番で使うエンドポイントが
-        #     叩けることの確認であるべき）
+        # ⚠️ v17.2: 旧 stock/list/symbols（Free で通る軽量 EP）は偽陽性の
+        #   原因だったため本番 EP へ変更。
+        # ⚠️ v18: snapshot 廃止に伴い history/greeks/eod へ変更。
         #
-        # ⚠️ v18 修正 (snapshot → history 移行):
-        #   rest.py が history 化され、本番は snapshot を一切叩かなくなった。
-        #   ヘルスチェックも本番が叩く history エンドポイントに合わせる。
-        #   合わせないと「snapshot は叩けるが history 系で 471 PERMISSION」
-        #   を見逃し、誤判断16 の偽陽性が再発する。
-        #
-        #   採用: /v3/option/history/greeks/eod。
-        #     理由: history 化後の本番の中核（IV 健全性フィルタの本丸）。
-        #           Options: STANDARD 権限が無いと 471 を返すため、
-        #           プラン権限の確認にもなる。
-        #     軽量化: expiration を 1 満期に絞る。expiration=* は
-        #             36 満期 約 6 MB を返し、60 回ループで重い。
-        #     date 固定: start_date=end_date=20260512 は「ヘルスチェック
-        #             専用の固定過去営業日」。本番の取得日とは無関係で、
-        #             権限と疎通の確認が目的。history なので過去日付の
-        #             データは安定して返る。
-        #
-        #   ⚠️ 実装後検証項目 → obs.K で決着 (v19):
-        #     固定 expiration=2026-06-18 は満期後も history/greeks/eod が
-        #     過去満期の過去データを問題なく返し続けることを実データで
-        #     確認済み（gex_history.json の 07/01・07/02・07/06 エントリが
-        #     満期経過後も正常生成）。ただし固定値は将来また陳腐化が
-        #     心配になる書き方であり、動的化を検討した。
-        #
-        #   ⚠️ v20 修正: v19 で expiration と start_date/end_date を
-        #     両方とも「実行日の30日前」に動的化したところ、両者は
-        #     本来独立した軸（expiration=どの満期契約か、
-        #     start_date/end_date=いつ時点のスナップショットか）なのに
-        #     同じ過去日を渡してしまい、「その日が満期日である契約の
-        #     満期当日のグリークス」という実在しない組み合わせを問い
-        #     合わせて 472 (NO_DATA) を返し続ける回帰を作り込んだ
-        #     （2026-07-19 実機で確認）。満期日を推測で決め打ちし直す
-        #     ことも誤判断22 の教訓に反するため、/v3/option/list/expirations
-        #     から実在する満期日一覧を動的に取得し、start_date/end_date
-        #     より確実に未来の満期（一覧の最後＝最も遠い満期）を使う形に
-        #     修正した。この一覧取得自体を Terminal 起動待ちの第一段階
-        #     としても使う（軽量なので 60 回ループしても負荷が小さい）。
+        # ⚠️ v20 修正（2026-07-19、2段階で確定）:
+        #   v19 で obs.K（固定日付 expiration=2026-06-18 / date=20260512 の
+        #   将来的な陳腐化）対策として日付を動的化したが、二重に誤った:
+        #     (1) expiration（どの満期契約か）と start_date/end_date（いつ
+        #         時点か）は独立した軸なのに両方「30日前」を渡し、「満期
+        #         当日のグリークス」という実在しない組合せで 472 を返した。
+        #     (2) 一次修正で date を「30日前」の素朴な暦計算のままにしたら
+        #         2026-06-19（Juneteenth＝市場完全休場）に着地し、休場日には
+        #         EOD が無く NOT_FOUND を返し続けた（誤判断22「取引日で
+        #         なければならない値を素朴な暦計算で決めない」の再演）。
+        #   最終修正: expiration も date も推測・暦計算で決めず、実在する
+        #   データ一覧の中央値（median）から取る。
+        #     - expiration = list/expirations の中央値。0DTE 近傍でも新規
+        #       上場したての遠い LEAPS でもない、履歴の厚い満期を確実に得る。
+        #     - date = その満期の list/dates/quote の中央値。実在する取引日
+        #       だけが並ぶ一覧の中央なので、休場日には当たらず（誤判断22 の
+        #       再演を防ぐ）、最新端（greeks 未生成＝誤判断36）でも最古端
+        #       （greeks 提供開始前＝誤判断29）でもない安全な位置になる。
+        #   最終段（phase C）で greeks/eod の 200 を確認し、471 検出という
+        #   本来の目的（誤判断16）を維持する。
         #
         #   curl の -w "%{http_code}" は接続失敗時も "000" を出力するので、
         #   || echo "000" は不要（付けると "000000" の二重出力になる）。
         run: |
           set +e  # curl 失敗時に即座に exit しない
 
-          # v19: start_date/end_date は実行日基準（UTC、30日前）で動的計算。
-          # こちらは「過去の日付ならなんでもよい」軸なので動的化して問題ない。
-          HEALTHCHECK_DATE=$(date -u -d '30 days ago' +%Y%m%d)
+          # csv の指定列を抽出（列順が入れ替わっても、CRLF が混ざっても、
+          # ヘッダ名で列を特定して値だけを出す）。
+          extract_col() {  # $1=url, $2=column-name
+            curl -s "$1" 2>/dev/null | awk -F',' -v want="$2" '
+              NR==1 { for (j=1;j<=NF;j++){ v=$j; gsub(/\r/,"",v); if(v==want) col=j } ; next }
+              col   { v=$col; gsub(/\r/,"",v); gsub(/"/,"",v); if(v!="") print v }
+            '
+          }
+          # ソート済み標準入力から中央値（median）の行を返す。
+          median() { awk '{a[NR]=$0} END { if(NR==0) exit 1; print a[int((NR+1)/2)] }'; }
 
-          # v20: expiration は推測せず、実在する満期日一覧から取得する。
-          # レスポンスが空/失敗の間は Terminal 未起動とみなしリトライ
-          # （list/expirations は軽量なので、ここで 60 回叩いてもコスト小）。
-          HEALTHCHECK_EXPIRATION=""
+          # ── phase A: 満期一覧 → 中央値の満期（Terminal 起動待ちも兼ねる）──
+          HC_EXP=""
           for i in $(seq 1 60); do
-            EXP_LIST=$(curl -s "http://127.0.0.1:25503/v3/option/list/expirations?symbol=SPY&format=csv" 2>/dev/null               | awk -F',' '
-                  NR==1 {
-                    for (j=1; j<=NF; j++) { gsub(/\r/,"",$j); if ($j=="expiration") col=j }
-                    next
-                  }
-                  col { v=$col; gsub(/\r/,"",v); gsub(/"/,"",v); if (v != "") print v }
-                ' | sort)
-            HEALTHCHECK_EXPIRATION=$(echo "$EXP_LIST" | tail -1)
-            if [ -n "$HEALTHCHECK_EXPIRATION" ]; then
-              echo "Attempt ${i}/60 (phase A): expirations list ready, using furthest expiration=${HEALTHCHECK_EXPIRATION}"
+            HC_EXP=$(extract_col "http://127.0.0.1:25503/v3/option/list/expirations?symbol=SPY&format=csv" expiration | sort | median)
+            if [ -n "$HC_EXP" ]; then
+              echo "Attempt ${i}/60 (phase A): expirations ready, median expiration=${HC_EXP}"
               break
             fi
-            echo "Attempt ${i}/60 (phase A): expirations list not ready yet, waiting..."
+            echo "Attempt ${i}/60 (phase A): expirations not ready yet, waiting..."
             sleep 1
           done
-
-          if [ -z "$HEALTHCHECK_EXPIRATION" ]; then
-            echo "❌ Could not obtain SPY expirations list within 60 seconds"
-            echo "── theta_terminal.log (last 50 lines) ──"
-            tail -50 theta_terminal.log || true
+          if [ -z "$HC_EXP" ]; then
+            echo "ERROR: Could not obtain SPY expirations within 60 seconds (phase A)"
+            echo "-- theta_terminal.log (last 50 lines) --"; tail -50 theta_terminal.log || true
             exit 1
           fi
 
-          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=${HEALTHCHECK_EXPIRATION}&start_date=${HEALTHCHECK_DATE}&end_date=${HEALTHCHECK_DATE}&format=csv"
-          echo "Healthcheck date: ${HEALTHCHECK_DATE} (expiration=${HEALTHCHECK_EXPIRATION})"
+          # ── phase B: その満期の実在データ日一覧 → 中央値の取引日 ──
+          HC_DATE=""
+          for i in $(seq 1 60); do
+            HC_DATE=$(extract_col "http://127.0.0.1:25503/v3/option/list/dates/quote?symbol=SPY&expiration=${HC_EXP}&format=csv" date | sort | median)
+            if [ -n "$HC_DATE" ]; then
+              echo "Attempt ${i}/60 (phase B): dates ready, median date=${HC_DATE}"
+              break
+            fi
+            echo "Attempt ${i}/60 (phase B): dates not ready yet, waiting..."
+            sleep 1
+          done
+          if [ -z "$HC_DATE" ]; then
+            echo "ERROR: Could not obtain data dates for expiration=${HC_EXP} within 60 seconds (phase B)"
+            echo "-- theta_terminal.log (last 50 lines) --"; tail -50 theta_terminal.log || true
+            exit 1
+          fi
+          HC_DATE_COMPACT=$(echo "$HC_DATE" | tr -d '-')  # greeks/eod は YYYYMMDD
+
+          # ── phase C: 本来のヘルスチェック（greeks/eod で 200 を確認）──
+          HEALTHCHECK_URL="http://127.0.0.1:25503/v3/option/history/greeks/eod?symbol=SPY&expiration=${HC_EXP}&start_date=${HC_DATE_COMPACT}&end_date=${HC_DATE_COMPACT}&format=csv"
+          echo "Healthcheck: expiration=${HC_EXP}, date=${HC_DATE_COMPACT}"
           for i in $(seq 1 60); do
             status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTHCHECK_URL" 2>/dev/null)
             if [ "$status" = "200" ]; then
-              echo "Theta Terminal is ready (took ${i} seconds in phase B)"
+              echo "Theta Terminal is ready (took ${i} seconds in phase C)"
               exit 0
             fi
-            echo "Attempt ${i}/60 (phase B): HTTP $status, waiting..."
+            echo "Attempt ${i}/60 (phase C): HTTP $status, waiting..."
             sleep 1
           done
-          echo "❌ Theta Terminal did not become ready within 60 seconds (phase B)"
-          echo "── theta_terminal.log (last 50 lines) ──"
-          tail -50 theta_terminal.log || true
+          echo "ERROR: Theta Terminal did not become ready within 60 seconds (phase C)"
+          echo "-- theta_terminal.log (last 50 lines) --"; tail -50 theta_terminal.log || true
           exit 1
 
       - name: Show Theta Terminal startup log (for confirmation)
