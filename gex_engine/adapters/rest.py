@@ -51,7 +51,7 @@ import csv
 import io
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -170,6 +170,9 @@ class ThetaRestAdapter:
         self.retry_backoff_base = retry_backoff_base
         self._client = client
         self._owned_client = client is None
+        # year_holidays のキャッシュ（誤判断: 当日カレンダー時刻依存の回避、
+        # 2026-07 実装）。schedule_type_on が年ごとに1回だけ取得する。
+        self._year_holiday_cache: dict[int, dict[date, str]] = {}
 
     # ── ライフサイクル ──
 
@@ -525,14 +528,125 @@ class ThetaRestAdapter:
 
         return type_value
 
+    def _fetch_year_holidays(self, year: int) -> dict[date, str]:
+        """calendar/year_holidays を叩き、その年の休場日 {date: type} を返す。
+
+        type は full_close / early_close のいずれか（手元資料
+        "Thetadata Calender Year Year Holiday (v3)" のレスポンス schema）。
+        year_holidays は「その年の参照データ」であって「当日」に依存しない
+        ため、当日 calendar/on_date が早朝 ET で 500 を返す不具合
+        （schedule_type_on の docstring 参照）とは無縁で、いつ叩いても返る。
+
+        Args:
+            year: 取得対象の西暦年。
+
+        Returns:
+            {date: "full_close" | "early_close"}。取引日（open）はキーに
+            含めない（呼び出し側で「休場日一覧に無ければ open」と扱う）。
+
+        Raises:
+            ThetaFatalError: 空レスポンス / 必須列（date, type）が無い。
+            ThetaPermissionError / ThetaRetryExhaustedError: _request_csv から伝播。
+        """
+        csv_text = self._request_csv(
+            "/calendar/year_holidays", {"year": str(year)}
+        )
+        if not csv_text.strip():
+            raise ThetaFatalError(
+                f"calendar/year_holidays returned empty for year={year}. "
+                f"Holiday reference data must always resolve; cannot continue.",
+                status_code=200,
+            )
+
+        rows = [
+            row for row in csv.reader(io.StringIO(csv_text))
+            if row and any(cell.strip() for cell in row)
+        ]
+        if not rows:
+            raise ThetaFatalError(
+                f"calendar/year_holidays: no rows for year={year}. "
+                f"body={csv_text[:200]!r}",
+                status_code=200,
+                body=csv_text[:500],
+            )
+
+        header = rows[0]
+        if "date" not in header or "type" not in header:
+            raise ThetaFatalError(
+                f"calendar/year_holidays: 'date'/'type' column not found for "
+                f"year={year}. header={header}",
+                status_code=200,
+                body=csv_text[:500],
+            )
+
+        date_idx = header.index("date")
+        type_idx = header.index("type")
+        holidays: dict[date, str] = {}
+        for row in rows[1:]:
+            date_str = row[date_idx].strip().strip('"')
+            type_value = row[type_idx].strip().strip('"').lower()
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                # 日付として解釈できない行は無視（想定外だが安全側）
+                logger.warning(
+                    "year_holidays: unparseable date %r for year=%d, skipping",
+                    date_str, year,
+                )
+                continue
+            if type_value in self._TRADING_DAY_TYPES:
+                # early_close は取引日。休場日一覧には入れるが、type を保持して
+                # 呼び出し側が early_close を正しく返せるようにする。
+                holidays[d] = type_value
+            elif type_value in self._CALENDAR_TYPES:
+                holidays[d] = type_value
+            else:
+                raise ThetaFatalError(
+                    f"calendar/year_holidays: unknown schedule type "
+                    f"{type_value!r} on {date_str} (year={year}). "
+                    f"Expected one of {sorted(self._CALENDAR_TYPES)}.",
+                    status_code=200,
+                    body=csv_text[:500],
+                )
+        return holidays
+
+    def _holidays_for_year(self, year: int) -> dict[date, str]:
+        """year_holidays を年単位でキャッシュして返す（同一 run 内で再取得しない）。"""
+        cached = self._year_holiday_cache.get(year)
+        if cached is None:
+            cached = self._fetch_year_holidays(year)
+            self._year_holiday_cache[year] = cached
+        return cached
+
     def schedule_type_on(self, target: date) -> str:
         """DataFetcher Protocol: 指定日の市場スケジュール type を返す。
 
-        検証済み低レベル関数 _fetch_calendar_on_date をそのまま公開する
-        ラッパ。OI/IV 取得ロジックには触れない（誤判断22/23/24 領域の不可侵）。
         market_calendar.next_business_day の schedule_lookup として注入される。
+
+        【当日カレンダー時刻依存の回避（誤判断: 2026-07-21 実機で発覚）】
+        next_business_day は trade_date から前方へ歩くため、新 cron（早朝 ET、
+        update_gex.yml v19〜）では最初の候補が「当日」になる。ところが
+        ThetaData の calendar/on_date は当日に対し早朝 ET 帯で HTTP 500
+        （"could not be parsed at index 0"）を返す一方、同じ当日でも遅い時刻
+        （実測 ET 09:25）では 200 を返す＝当日スケジュールの利用可能時刻に
+        境界があり、cron の発火時刻がその前に来ていた（§5.10 で greeks/OI の
+        境界は測ったが calendar は未測だった盲点）。
+
+        そこで当日 calendar を一切引かず、「その年の休場日一覧
+        （calendar/year_holidays、当日非依存の参照データ）」＋「曜日」から
+        ローカルに type を決める。これにより発火時刻に関係なく確実に解決できる。
+        （過去日を照会する _resolve_trade_date は on_date のままで影響を
+        受けない。OI/IV 取得ロジックにも触れない＝誤判断22/23/24 領域の不可侵。）
+
+        判定:
+            土日                         -> "weekend"
+            year_holidays に full_close  -> "full_close"
+            year_holidays に early_close -> "early_close"（取引日）
+            上記いずれでもない平日        -> "open"
         """
-        return self._fetch_calendar_on_date(target)
+        if target.weekday() >= 5:  # 5=土, 6=日
+            return "weekend"
+        return self._holidays_for_year(target.year).get(target, "open")
 
     # 営業日とみなす type。early_close（短縮営業日）も取引日であり、
     # EOD レポートは生成されるため取引日に含める（DESIGN 3.3 step4）。
@@ -562,16 +676,9 @@ class ThetaRestAdapter:
         greeks/eod は実測で引けから8h57m〜9h10m後（PC_PIPELINE §5.10）
         には生成済みのため、このタイミングでは安全に取得できる。
 
-        旧設計（〜2026-07）は cron が引けと同日の夕方（ET 17:30 前後）に
-        発火する前提で、当日 EOD 生成（ET 17:15）からのマージンが15分
-        しかないため、意図的に1日分を切り捨てていた。その後 cron 時刻
-        だけが変更され（v17.4, UTC 22:30→21:47）、この関数の前提が
-        追従せず化石化した結果、鮮度を1日分失わせ続けていたのが
-        誤判断36の本体（PC_GOVERNANCE 参照）。
-
-        次に cron 時刻を変更する／このロジックを見直す際は、
-        「cron 発火時点で as_of がどの暦日を指すか」を必ず
-        PC_PIPELINE §5.10 の実測値（生成境界）と突き合わせること。
+        なお本関数は過去日のみ calendar/on_date で照会するため、当日
+        calendar が早朝 ET で 500 を返す不具合（schedule_type_on の
+        docstring 参照）の影響を受けない。
 
         Args:
             as_of: 処理基準日（通常は run_daily.py が渡す today）。
