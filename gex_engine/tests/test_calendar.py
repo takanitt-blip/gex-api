@@ -300,34 +300,85 @@ def test_resolve_trade_date_lookback_boundary(
 # 検証対象）は誤読由来の概念だったため、テストごと削除する
 # のが正しい（PC_GOVERNANCE 4.1 / 誤判断15 系統）。
 
-# ── 公開ラッパ schedule_type_on（obs.G: Protocol 経由のカレンダー lookup）──
+# ── 公開ラッパ schedule_type_on（当日カレンダー時刻依存の回避、v22）──
+#
+# 旧仕様: schedule_type_on は calendar/on_date へ委譲していた。しかし
+# next_business_day の前方歩きが「当日」を照会すると、ThetaData の
+# calendar/on_date は早朝 ET 帯で HTTP 500 を返す（2026-07-21 実機で発覚）。
+# 新仕様: 当日を一切引かず、year_holidays（当日非依存の参照データ）＋曜日から
+# ローカルに type を決める。よって本クラスは on_date ではなく year_holidays を
+# モックし、full_close/early_close/open/weekend の各判定・年指定・キャッシュを
+# 検証する（PC_GOVERNANCE 該当誤判断 / PC_PIPELINE §5.10 関連）。
+
+YEAR_HOLIDAYS_URL = f"{BASE_URL}/calendar/year_holidays"
+
+# year_holidays の実 schema（date,type,open,close。type は full_close/early_close
+# のみ。open は列に含まれない＝「一覧に無い平日は open」と解釈する）。
+CSV_YEAR_HOLIDAYS_2026 = (
+    "date,type,open,close\n"
+    '"2026-01-01","full_close",,\n'
+    '"2026-07-03","full_close",,\n'
+    '"2026-11-27","early_close","09:30:00","13:00:00"\n'
+    '"2026-12-25","full_close",,\n'
+    "\n"
+)
+
 
 class TestScheduleTypeOn:
-    """schedule_type_on は _fetch_calendar_on_date をそのまま公開するラッパ。"""
+    """schedule_type_on は year_holidays＋曜日からローカルに type を決める（v22）。
+
+    当日 calendar/on_date の早朝 ET 500 を回避するための実装で、on_date には
+    一切依存しない。テストも year_holidays をモックして検証する。
+    """
 
     @respx.mock
-    def test_returns_open(self, adapter: ThetaRestAdapter) -> None:
-        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_OPEN))
+    def test_open_weekday_not_in_holidays(self, adapter: ThetaRestAdapter) -> None:
+        # 平日（金）かつ休場日一覧に無い → open
+        respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
         assert adapter.schedule_type_on(date(2026, 5, 15)) == "open"
 
     @respx.mock
-    def test_returns_early_close(self, adapter: ThetaRestAdapter) -> None:
-        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_EARLY_CLOSE))
-        assert adapter.schedule_type_on(date(2025, 11, 28)) == "early_close"
+    def test_full_close_from_year_holidays(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
+        # 2026-12-25（金）は full_close
+        assert adapter.schedule_type_on(date(2026, 12, 25)) == "full_close"
 
     @respx.mock
-    def test_returns_full_close(self, adapter: ThetaRestAdapter) -> None:
-        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_FULL_CLOSE))
-        assert adapter.schedule_type_on(date(2025, 12, 25)) == "full_close"
+    def test_early_close_from_year_holidays(self, adapter: ThetaRestAdapter) -> None:
+        respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
+        # 2026-11-27（金）は early_close（取引日扱い）
+        assert adapter.schedule_type_on(date(2026, 11, 27)) == "early_close"
 
     @respx.mock
-    def test_returns_weekend(self, adapter: ThetaRestAdapter) -> None:
-        respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_WEEKEND))
-        assert adapter.schedule_type_on(date(2026, 5, 16)) == "weekend"
+    def test_weekend_short_circuits_without_http(self, adapter: ThetaRestAdapter) -> None:
+        # 土日はカレンダーを引かずに weekend（year_holidays を一切叩かない）
+        route = respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
+        assert adapter.schedule_type_on(date(2026, 5, 16)) == "weekend"  # 土
+        assert not route.called
 
     @respx.mock
-    def test_delegates_with_yyyymmdd(self, adapter: ThetaRestAdapter) -> None:
-        route = respx.get(ON_DATE_URL).mock(return_value=httpx.Response(200, text=CSV_OPEN))
+    def test_queries_year_holidays_with_target_year(self, adapter: ThetaRestAdapter) -> None:
+        route = respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
         adapter.schedule_type_on(date(2026, 5, 15))
         assert route.called
-        assert route.calls.last.request.url.params["date"] == "20260515"
+        assert route.calls.last.request.url.params["year"] == "2026"
+
+    @respx.mock
+    def test_caches_year_holidays_across_calls(self, adapter: ThetaRestAdapter) -> None:
+        # 同一 run 内で同じ年を何度照会しても year_holidays 取得は1回だけ
+        route = respx.get(YEAR_HOLIDAYS_URL).mock(
+            return_value=httpx.Response(200, text=CSV_YEAR_HOLIDAYS_2026)
+        )
+        for _ in range(5):
+            adapter.schedule_type_on(date(2026, 5, 15))
+        assert route.call_count == 1
